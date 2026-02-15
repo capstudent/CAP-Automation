@@ -1,5 +1,6 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -1335,11 +1336,14 @@ class AutomationService:
                         time.sleep(3)
                         continue
                     
-                    # Find privilege in table
+                    # Find privilege in table - iterate over TR elements (direct rows), not inside a single tr
                     try:
-                        tbody = self.driver.find_element(By.TAG_NAME, 'tbody')
-                        rows = tbody.find_elements(By.TAG_NAME, 'tr')
-                    except:
+                        tbody = WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.TAG_NAME, 'tbody'))
+                        )
+                        time.sleep(1)
+                        rows = tbody.find_elements(By.XPATH, './tr')
+                    except Exception:
                         result['error'] = "No privileges found"
                         results.append(result)
                         self.driver.find_element(
@@ -1350,47 +1354,103 @@ class AutomationService:
                         continue
                     
                     privilege_found = False
-                    for row in rows:
+                    for i in range(len(rows)):
                         try:
-                            span = row.find_element(By.XPATH, f'.//span[contains(text(), "{app_name}")]')
-                            if span:
-                                # Click Edit
-                                edit_link = row.find_element(By.XPATH, './/a[contains(text(), "Edit")]')
-                                edit_link.click()
-                                time.sleep(3)
-                                
-                                # Set expiration reason
-                                select_element = Select(self.driver.find_element(By.NAME, "exp_reason"))
-                                select_element.select_by_visible_text("Revoked")
-                                
-                                # Add comment
+                            rows = tbody.find_elements(By.XPATH, './tr')
+                            if i >= len(rows):
+                                break
+                            row = rows[i]
+                            spans = row.find_elements(By.XPATH, './/span')
+                            print(f"  [DEBUG] Row {i + 1}/{len(rows)}: checking {len(spans)} span(s) for '{app_name}'")
+                            for j, s in enumerate(spans):
+                                raw_text = (s.text or "").strip()
+                                data_content = s.get_attribute("data-content") or ""
+                                print(f"    span[{j}] raw_text={repr(s.text)} -> trimmed={repr(raw_text)} | data-content={repr(data_content)} | match_text={app_name in raw_text} | match_data={app_name in data_content}")
+                            # Match by element content: span text (e.g. "BIOR") or data-content (e.g. "BioRender")
+                            try:
+                                span = row.find_element(By.XPATH, f'.//span[contains(normalize-space(.), "{app_name}") or contains(@data-content, "{app_name}")]')
+                            except NoSuchElementException:
+                                continue
+                            # Click Edit
+                            edit_link = row.find_element(By.XPATH, './/a[contains(text(), "Edit")]')
+                            edit_link.click()
+                            time.sleep(3)
+                            
+                            # Check current expiration reason; if already set, skip and note it
+                            select_element = Select(self.driver.find_element(By.NAME, "exp_reason"))
+                            current_reason_elem = select_element.first_selected_option
+                            current_reason = (current_reason_elem.text or "").strip()
+                                if current_reason and current_reason.lower() != "select a reason":
+                                    result['error'] = f"Privilege already {current_reason}"
+                                    result['success'] = True
+                                    self.driver.find_element(By.LINK_TEXT, "People").click()
+                                    time.sleep(3)
+                                    privilege_found = True
+                                    break
+                            
+                            # Set expiration reason
+                            select_element.select_by_visible_text("Revoked")
+                            time.sleep(1)
+                            
+                            # Add comment (append on new line, don't overwrite existing content)
+                            textarea = None
+                            try:
+                                textarea = self.driver.find_element(By.ID, "comments")
+                            except Exception:
                                 textarea = self.driver.find_element(By.NAME, "comments")
-                                existing_text = textarea.get_attribute("value") or ""
-                                new_text = (existing_text + " " + comment).strip() if comment else existing_text
-                                textarea.clear()
-                                textarea.send_keys(new_text)
-                                
-                                # Save
+                            existing_text = textarea.get_attribute("value") or ""
+                            new_text = (existing_text.rstrip() + "\n" + dp_number).strip() if dp_number else existing_text
+                            textarea.clear()
+                            textarea.send_keys(new_text)
+                            time.sleep(1)
+                            
+                            # Click save button (must click before returning to search)
+                            save_xpath = "/html/body/div[1]/div/div[2]/div[3]/form/div[2]/div/div/div/button"
+                            submit_button = None
+                            try:
                                 submit_button = WebDriverWait(self.driver, 10).until(
-                                    EC.element_to_be_clickable((By.XPATH, '//button[@type="submit" and text()="Save"]'))
+                                    EC.presence_of_element_located((By.XPATH, save_xpath))
                                 )
-                                submit_button.click()
-                                time.sleep(3)
-                                
-                                # Return to People page
+                            except Exception:
+                                try:
+                                    submit_button = self.driver.find_element(By.XPATH, "//form//button[@type='submit']")
+                                except Exception:
+                                    try:
+                                        submit_button = self.driver.find_element(By.XPATH, "//form//button[contains(., 'Save')]")
+                                    except Exception:
+                                        pass
+                            if not submit_button:
+                                result['error'] = "Save button not found"
                                 self.driver.find_element(By.LINK_TEXT, "People").click()
                                 time.sleep(3)
-                                
-                                result['success'] = True
-                                privilege_found = True
                                 break
-                        except:
-                            continue
+                            self.driver.execute_script("arguments[0].click();", submit_button)
+                            time.sleep(3)
+                            
+                            # Return to People page
+                            self.driver.find_element(By.LINK_TEXT, "People").click()
+                            time.sleep(3)
+                            
+                            result['success'] = True
+                            privilege_found = True
+                            break
+                        except Exception as e:
+                            result['error'] = str(e)
+                            try:
+                                self.driver.find_element(By.LINK_TEXT, "People").click()
+                                time.sleep(3)
+                            except Exception:
+                                pass
+                            break
                     
                     if not privilege_found:
-                        result['error'] = f"Privilege for '{app_name}' not found"
-                        self.driver.find_element(By.LINK_TEXT, "People").click()
-                        time.sleep(3)
+                        if not result.get('error'):
+                            result['error'] = f"Privilege for '{app_name}' not found"
+                        try:
+                            self.driver.find_element(By.LINK_TEXT, "People").click()
+                            time.sleep(3)
+                        except Exception:
+                            pass
                 
                 except OperationAbortedException:
                     raise
@@ -1403,94 +1463,95 @@ class AutomationService:
         
         return results
     
-    def get_employment_status(self, ids, id_type='SID', on_result_callback=None):
+    def get_employment_status(self, ids, id_type='SID', to_fields=None, on_result_callback=None):
         """
-        Get employment status and source for users
-        
-        Args:
-            ids: List of user IDs to look up
-            id_type: Type of ID ('SID', 'BID', or 'N')
-            on_result_callback: Optional function to call after each result with (index, result)
+        Get status fields: Source System, Employment Status, Student Status Code.
+        to_fields: list of 'SOURCE_SYSTEM', 'EMPLOYMENT_STATUS', 'STUDENT_STATUS_CODE'
         """
         if not self.driver:
             raise Exception("Not logged in. Please login first.")
-        
+        if not to_fields:
+            to_fields = ['SOURCE_SYSTEM', 'EMPLOYMENT_STATUS']
         results = []
-        
         try:
             for index, user_id in enumerate(ids):
                 self._check_abort()
-                result = {'id': user_id, 'employment_status': None, 'source': None, 'success': False, 'error': None}
+                result = {
+                    'id': user_id, 'source': None, 'employment_status': None, 'student_status_code': None,
+                    'success': False, 'error': None
+                }
                 try:
-                    # Search for user based on ID type
                     search_button = self.driver.find_element(By.NAME, "search")
-                    
                     if id_type == 'BID':
-                        text_box = self.driver.find_element(By.NAME, "brown_id")
+                        text_box = self.driver.find_element(By.ID, "brown_id")
                     elif id_type == 'SID':
                         text_box = self.driver.find_element(By.NAME, "brown_login")
-                    else:  # Name
+                    else:
                         text_box = self.driver.find_element(By.NAME, "brown_login")
-                    
                     text_box.clear()
                     text_box.send_keys(user_id)
                     time.sleep(2)
                     search_button.click()
                     time.sleep(3)
-                    
-                    # Click View Overview
                     try:
                         vo = self.driver.find_element(
                             By.XPATH,
                             "//a[@class='btn btn-default' and contains(text(), 'View Overview')]"
                         )
                         vo.click()
-                    except:
+                    except Exception:
                         result['error'] = "User not found"
                         results.append(result)
-                        
-                        # Call callback immediately after result
                         if on_result_callback:
                             on_result_callback(index, result)
-                        
                         continue
-                    
                     time.sleep(2)
-                    
-                    # Get employment status and source
+                    self._check_abort()
                     try:
-                        if id_type == 'BID':
-                            employment_status_div = self.driver.find_element(
-                                By.XPATH,
-                                "//label[@class='col-xs-6' and contains(text(), 'Employment Status')]/following-sibling::div[@class='col-xs-6']"
-                            )
-                            source_div = self.driver.find_element(
-                                By.XPATH,
-                                "//label[@class='col-xs-6' and contains(text(), 'Source')]/following-sibling::div[@class='col-xs-6']"
-                            )
-                        else:  # SID
-                            employment_status_div = self.driver.find_element(
-                                By.XPATH,
-                                "//b[@class='col-xs-6' and contains(text(), 'Employment Status:')]/following-sibling::div[@class='col-xs-6']"
-                            )
-                            source_div = self.driver.find_element(
-                                By.XPATH,
-                                "//b[@class='col-xs-6' and contains(text(), 'Source')]/following-sibling::div[@class='col-xs-6']"
-                            )
-                        
-                        result['employment_status'] = employment_status_div.text
-                        result['source'] = source_div.text
+                        # Same Overview page for BID and SID; use same XPaths as Short ID
+                        employment_status_div = self.driver.find_element(
+                            By.XPATH,
+                            "//b[@class='col-xs-6' and contains(text(), 'Employment Status:')]/following-sibling::div[@class='col-xs-6']"
+                        )
+                        source_div = self.driver.find_element(
+                            By.XPATH,
+                            "//b[@class='col-xs-6' and contains(text(), 'Source')]/following-sibling::div[@class='col-xs-6']"
+                        )
+                        if 'SOURCE_SYSTEM' in to_fields:
+                            result['source'] = source_div.text.strip()
+                        if 'EMPLOYMENT_STATUS' in to_fields:
+                            result['employment_status'] = employment_status_div.text.strip()
                         result['success'] = True
                     except Exception as e:
                         result['error'] = f"Could not extract data: {str(e)}"
-                    
-                    # Return to People page
+                    if result['success'] and 'STUDENT_STATUS_CODE' in to_fields:
+                        student_status_xpath = "/html/body/div[1]/div/div[2]/div[3]/div[2]/div/div[4]/div[1]/div/div/div"
+                        result['student_status_code'] = ''
+                        for link_index in (4, 5):
+                            try:
+                                link = self.driver.find_element(
+                                    By.XPATH,
+                                    f"/html/body/div[1]/div/div[1]/div/div/a[{link_index}]"
+                                )
+                                link.click()
+                                time.sleep(2)
+                                self._check_abort()
+                                student_div = self.driver.find_element(By.XPATH, student_status_xpath)
+                                value = student_div.text.strip()
+                                if value:
+                                    result['student_status_code'] = value
+                                    break
+                            except Exception as e:
+                                if link_index == 4:
+                                    print(f"  Student Status Code not at a[4], trying a[5]: {e}")
+                                else:
+                                    print(f"  ⚠️  Student Status Code not found: {e}")
+                                continue
                     people_button = self.driver.find_element(
                         By.XPATH,
                         "//a[@class='selected' and contains(text(), 'People')]"
                     )
                     people_button.click()
-                    
                 except OperationAbortedException:
                     raise
                 except Exception as e:

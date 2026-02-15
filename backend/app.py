@@ -629,77 +629,73 @@ def revoke_privileges():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+STATUS_FIELD_TO_RESULT = {
+    'SOURCE_SYSTEM': 'source',
+    'EMPLOYMENT_STATUS': 'employment_status',
+    'STUDENT_STATUS_CODE': 'student_status_code',
+}
+STATUS_FIELD_HEADERS = {
+    'SOURCE_SYSTEM': 'Source System',
+    'EMPLOYMENT_STATUS': 'Employment Status',
+    'STUDENT_STATUS_CODE': 'Student Status Code',
+}
+
 @app.route('/api/automation/get-employment-status', methods=['POST'])
 def get_employment_status():
-    """Get employment status and source for users - writes to Google Sheets"""
+    """Get status fields (Source System, Employment Status, Student Status Code) - writes to Google Sheets"""
     try:
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
         ids = data.get('ids', [])
-        id_type = data.get('id_type', 'SID')  # BID, SID, or N
-        column_index = data.get('column_index', 0)  # Column A (index 0) for IDs
-        write_column = data.get('write_column', 'G')  # Column for employment status
-        source_column = data.get('source_column', 'J')  # Column for source
-        
+        id_type = data.get('id_type', 'SID')
+        column_index = data.get('column_index', 0)
+        to_fields = data.get('to_fields', ['SOURCE_SYSTEM', 'EMPLOYMENT_STATUS'])
+        write_columns = data.get('write_columns', {})
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
-        
-        # Authenticate
+        if not to_fields or not write_columns:
+            return jsonify({'success': False, 'error': 'Select at least one field to get and a column for each'}), 400
         try:
             authenticate_sheets_service(data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
-        
-        # Connect to sheet
         worksheet = sheets_service.connect(sheet_url, sheet_name)
-        
-        # If IDs not provided, read from sheet
         if not ids:
             columns = sheets_service.get_columns(worksheet)
             if column_index >= len(columns):
                 return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
             ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
-        
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs provided or found'}), 400
-        
-        print(f"📊 Starting employment status check for {len(ids)} users")
-        print(f"📝 Will write status to column {write_column}, source to column {source_column}")
-        
-        # Define callback to update sheet after each result
-        def update_sheet_callback(index, result):
-            """Update Google Sheets immediately after processing each user"""
-            row_number = index + 2  # +2 because: +1 for 0-index, +1 for header row
-            
-            if result.get('success'):
-                emp_status = result.get('employment_status', '')
-                source = result.get('source', '')
-                print(f"  ✅ [{index+1}/{len(ids)}] {result.get('id')}: Status='{emp_status}', Source='{source}'")
-            else:
-                emp_status = 'Not found'
-                source = 'Not found'
-                error = result.get('error', 'Unknown error')
-                print(f"  ❌ [{index+1}/{len(ids)}] {result.get('id')}: {error}")
-            
-            # Update both columns for this row immediately
+        print(f"📊 Starting status check for {len(ids)} users, fields: {to_fields}")
+        for f, col in write_columns.items():
+            if f not in to_fields:
+                continue
+            title = STATUS_FIELD_HEADERS.get(f, f)
             try:
-                status_cell = f'{write_column}{row_number}'
-                source_cell = f'{source_column}{row_number}'
-                
-                # Update both cells
-                worksheet.update(status_cell, [[emp_status]])
-                worksheet.update(source_cell, [[source]])
-                
-                print(f"  📝 Updated sheet: {status_cell}='{emp_status}', {source_cell}='{source}'")
+                worksheet.update(f'{col}1', [[title]])
+                print(f"  📌 Header {col}1 = '{title}'")
             except Exception as e:
-                print(f"  ⚠️  Failed to update sheet for row {row_number}: {str(e)}")
-        
-        # Process all IDs with real-time sheet updates
-        results = automation_service.get_employment_status(ids, id_type, on_result_callback=update_sheet_callback)
-        
-        print(f"✅ Completed employment status check for {len(ids)} users")
-        
+                print(f"  ⚠️  Failed to write header {col}1: {str(e)}")
+        def update_sheet_callback(index, result):
+            row_number = index + 2
+            fill = 'Not found' if not result.get('success') else None
+            for f, col in write_columns.items():
+                if f not in to_fields:
+                    continue
+                key = STATUS_FIELD_TO_RESULT.get(f, f.lower())
+                val = fill if fill else result.get(key, '') or ''
+                if fill is None and result.get('success'):
+                    print(f"  ✅ [{index+1}/{len(ids)}] {result.get('id')} {f}='{val}'")
+                try:
+                    worksheet.update(f'{col}{row_number}', [[val]])
+                except Exception as e:
+                    print(f"  ⚠️  Failed to update {col}{row_number}: {str(e)}")
+        results = automation_service.get_employment_status(
+            ids, id_type, to_fields=to_fields, on_result_callback=update_sheet_callback
+        )
+        print(f"✅ Completed status check for {len(ids)} users")
         return jsonify({
             'success': True,
             'results': results,

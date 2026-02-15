@@ -760,18 +760,28 @@ async function revokePrivileges() {
 }
 
 function formatRevokeResults(results) {
-    return formatAddResults(results); // Same format
+    if (!results || results.length === 0) return '<p>No results</p>';
+    let html = '<table><thead><tr><th>ID</th><th>Status</th><th>Error</th></tr></thead><tbody>';
+    results.forEach(result => {
+        const isAlreadySet = result.error && result.error.startsWith('Privilege already ');
+        const statusClass = result.success || isAlreadySet ? 'success' : 'error';
+        const statusText = result.success ? 'Success' : (isAlreadySet ? 'Success' : 'Failed');
+        html += `
+            <tr class="result-item ${statusClass}">
+                <td>${result.id}</td>
+                <td>${statusText}</td>
+                <td>${result.error || '-'}</td>
+            </tr>
+        `;
+    });
+    html += '</tbody></table>';
+    return html;
 }
 
 // Get employment status
 async function getEmploymentStatus() {
-    // Get sheet info from global connection
     const sheetInfo = requireSheetConnection('status-status');
-    if (!sheetInfo) {
-        return;
-    }
-    
-    // Refresh sheet data before processing - show abort button immediately
+    if (!sheetInfo) return;
     setOperationRunning('status', true);
     showStatus('status-status', 'Refreshing sheet data...', 'info');
     const refreshed = await refreshSheetConnection();
@@ -780,19 +790,28 @@ async function getEmploymentStatus() {
         setOperationRunning('status', false);
         return;
     }
-    
     const idsText = document.getElementById('status-ids').value;
     const idType = document.getElementById('status-id-type').value;
     const columnIndex = parseInt(document.getElementById('status-read-column').value);
-    const writeColumn = document.getElementById('status-write-column').value;
-    const sourceColumn = document.getElementById('status-source-column').value;
-    
+    const toFields = [];
+    const writeColumns = {};
+    document.querySelectorAll('#status-writes-inline .convert-write-chip').forEach(chip => {
+        const type = chip.dataset.type;
+        const sel = chip.querySelector('select.convert-chip-col');
+        if (type && sel) {
+            toFields.push(type);
+            writeColumns[type] = sel.value;
+        }
+    });
+    if (toFields.length === 0) {
+        showStatus('status-status', 'Select at least one field to get (click "Add field to get").', 'error');
+        setOperationRunning('status', false);
+        return;
+    }
     const ids = idsText.trim() ? idsText.split('\n').map(id => id.trim()).filter(id => id) : [];
-    
     clearStatus('status-status');
     clearResults('status-results');
-    showStatus('status-status', 'Fetching employment status...', 'info');
-    
+    showStatus('status-status', 'Fetching statuses...', 'info');
     try {
         const serviceAccountData = await getServiceAccountData();
         const oauthState = getOAuthState();
@@ -802,20 +821,15 @@ async function getEmploymentStatus() {
             ids: ids.length > 0 ? ids : undefined,
             id_type: idType,
             column_index: columnIndex,
-            write_column: writeColumn,
-            source_column: sourceColumn
+            to_fields: toFields,
+            write_columns: writeColumns
         };
-        
-        if (oauthState) {
-            requestData.oauth_state = oauthState;
-        } else {
-            Object.assign(requestData, serviceAccountData);
-        }
-        
+        if (oauthState) requestData.oauth_state = oauthState;
+        else Object.assign(requestData, serviceAccountData);
         const result = await apiCall('/automation/get-employment-status', 'POST', requestData);
-        
-        showStatus('status-status', `Status retrieved and written to columns ${writeColumn} and ${sourceColumn}`, 'success');
-        showResults('status-results', result.results, formatStatusResults);
+        const colList = toFields.map(f => `${STATUS_FIELD_LABELS[f] || f}→${writeColumns[f]}`).join(', ');
+        showStatus('status-status', `Written to: ${colList}`, 'success');
+        showResults('status-results', result.results, (r) => formatStatusResults(r, toFields));
     } catch (error) {
         showStatus('status-status', `Error: ${error.message}`, 'error');
     } finally {
@@ -823,25 +837,109 @@ async function getEmploymentStatus() {
     }
 }
 
-function formatStatusResults(results) {
+function formatStatusResults(results, toFields) {
     if (!results || results.length === 0) return '<p>No results</p>';
-    
-    let html = '<table><thead><tr><th>ID</th><th>Employment Status</th><th>Source</th><th>Status</th></tr></thead><tbody>';
-    
+    const keys = { SOURCE_SYSTEM: 'source', EMPLOYMENT_STATUS: 'employment_status', STUDENT_STATUS_CODE: 'student_status_code' };
+    let html = '<table><thead><tr><th>ID</th>';
+    (toFields || []).forEach(f => { html += `<th>${STATUS_FIELD_LABELS[f] || f}</th>`; });
+    html += '<th>Status</th></tr></thead><tbody>';
     results.forEach(result => {
         const statusClass = result.success ? 'success' : 'error';
-        html += `
-            <tr class="result-item ${statusClass}">
-                <td>${result.id}</td>
-                <td>${result.employment_status || '-'}</td>
-                <td>${result.source || '-'}</td>
-                <td>${result.success ? 'Success' : result.error}</td>
-            </tr>
-        `;
+        html += '<tr class="result-item ' + statusClass + '"><td>' + result.id + '</td>';
+        (toFields || []).forEach(f => {
+            const key = keys[f];
+            html += '<td>' + (result[key] != null ? result[key] : '-') + '</td>';
+        });
+        html += '<td>' + (result.success ? 'Success' : result.error) + '</td></tr>';
     });
-    
     html += '</tbody></table>';
     return html;
+}
+
+// Statuses — multi-select (Source System, Employment Status, Student Status Code)
+const STATUS_FIELD_LABELS = { SOURCE_SYSTEM: 'Source System', EMPLOYMENT_STATUS: 'Employment Status', STUDENT_STATUS_CODE: 'Student Status Code' };
+const STATUS_DEFAULT_COLUMNS = ['G', 'H', 'I'];
+let statusToSelections = [];
+
+function getNextDefaultStatusColumn() {
+    const used = new Set(statusToSelections.map(s => s.column));
+    for (const c of STATUS_DEFAULT_COLUMNS) {
+        if (!used.has(c)) return c;
+    }
+    for (const c of COLUMN_LETTERS) {
+        if (!used.has(c)) return c;
+    }
+    return 'Z';
+}
+
+function renderStatusWritesList() {
+    const el = document.getElementById('status-writes-inline');
+    const prefix = document.getElementById('status-writes-prefix');
+    const sep = document.getElementById('status-writes-sep');
+    if (!el) return;
+    if (prefix) prefix.textContent = statusToSelections.length > 0 ? 'and writes ' : '';
+    if (sep) sep.textContent = statusToSelections.length > 0 ? ', ' : '';
+    if (statusToSelections.length === 0) {
+        el.innerHTML = '';
+        return;
+    }
+    const parts = statusToSelections.map((s, i) => {
+        const and = i > 0 ? '<span class="convert-writes-and">and</span>' : '';
+        return and + `<span class="convert-write-chip" data-type="${s.type}"><strong>${s.label}</strong> in column <select class="convert-chip-col status-chip-col" data-type="${s.type}">${getConvertColumnOptionsHtml(s.column)}</select><button type="button" class="convert-chip-remove" aria-label="Remove">×</button></span>`;
+    });
+    el.innerHTML = parts.join('');
+    el.querySelectorAll('.status-chip-col').forEach(sel => {
+        sel.addEventListener('change', function() {
+            const s = statusToSelections.find(x => x.type === this.dataset.type);
+            if (s) s.column = this.value;
+        });
+    });
+    el.querySelectorAll('.convert-chip-remove').forEach(btn => {
+        btn.addEventListener('click', function() {
+            const chip = this.closest('.convert-write-chip');
+            if (chip) {
+                const t = chip.dataset.type;
+                statusToSelections = statusToSelections.filter(x => x.type !== t);
+                renderStatusWritesList();
+            }
+        });
+    });
+}
+
+function initStatusTypeDropdown() {
+    // Only close on outside click (same as Convert). Opening is handled by onclick in index.html head (toggleStatusAddType).
+    document.body.addEventListener('click', function(e) {
+        const addBtn = document.getElementById('status-add-type-btn');
+        const dropdown = document.getElementById('status-type-dropdown');
+        const wrapper = document.getElementById('status-type-wrapper');
+        if (!addBtn || !dropdown || !wrapper) return;
+        if (e.target.id === 'status-add-type-btn' || e.target.closest('#status-add-type-btn')) return;
+        const option = e.target.closest('#status-type-dropdown button[role="option"]');
+        if (option && dropdown.classList.contains('open')) {
+            e.preventDefault();
+            e.stopPropagation();
+            const type = option.dataset.type;
+            if (type && typeof statusToSelections !== 'undefined' && !statusToSelections.some(s => s.type === type)) {
+                statusToSelections.push({
+                    type,
+                    label: STATUS_FIELD_LABELS[type] || type,
+                    column: getNextDefaultStatusColumn()
+                });
+                if (typeof renderStatusWritesList === 'function') renderStatusWritesList();
+            }
+            dropdown.classList.remove('open');
+            dropdown.style.display = 'none';
+            addBtn.setAttribute('aria-expanded', 'false');
+            dropdown.setAttribute('aria-hidden', 'true');
+            return;
+        }
+        if (dropdown.classList.contains('open') && !wrapper.contains(e.target)) {
+            dropdown.classList.remove('open');
+            dropdown.style.display = 'none';
+            addBtn.setAttribute('aria-expanded', 'false');
+            dropdown.setAttribute('aria-hidden', 'true');
+        }
+    });
 }
 
 // Convert IDs — multi-select UI (sentence + dropdown)
@@ -942,9 +1040,13 @@ function initConvertTypeDropdown() {
     });
 }
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initConvertTypeDropdown);
+    document.addEventListener('DOMContentLoaded', function() {
+        initConvertTypeDropdown();
+        initStatusTypeDropdown();
+    });
 } else {
     initConvertTypeDropdown();
+    initStatusTypeDropdown();
 }
 
 // Convert IDs

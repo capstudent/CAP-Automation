@@ -382,6 +382,18 @@ table tr:hover {
 .convert-type-dropdown.open {
     display: block;
 }
+.convert-type-dropdown-open .convert-type-dropdown {
+    display: block;
+}
+#status-type-dropdown.open,
+#status-type-dropdown[style*="block"] {
+    display: block !important;
+    z-index: 10004;
+}
+.convert-add-row {
+    margin-top: 6px;
+    margin-bottom: 8px;
+}
 .convert-type-dropdown button[role="option"] {
     display: block;
     width: 100%;

@@ -17,6 +17,17 @@
         btn.setAttribute('aria-expanded', isOpen);
         dd.setAttribute('aria-hidden', !isOpen);
     };
+    window.toggleStatusAddType = function(e) {
+        console.log('Status Add Type button clicked');
+        if (e) { e.preventDefault(); e.stopPropagation(); }
+        var dd = document.getElementById('status-type-dropdown');
+        var btn = document.getElementById('status-add-type-btn');
+        if (!dd || !btn) return;
+        var isOpen = dd.classList.toggle('open');
+        dd.style.display = isOpen ? 'block' : 'none';
+        btn.setAttribute('aria-expanded', isOpen);
+        dd.setAttribute('aria-hidden', !isOpen);
+    };
     </script>
 </head>
 <body>
@@ -30,7 +41,7 @@
             <button class="tab-button active" onclick="showTab('connection', this)">Connection</button>
             <button class="tab-button" onclick="showTab('add', this)">Add Privileges</button>
             <button class="tab-button" onclick="showTab('revoke', this)">Revoke Privileges</button>
-            <button class="tab-button" onclick="showTab('status', this)">Employment Status</button>
+            <button class="tab-button" onclick="showTab('status', this)">Statuses</button>
             <button class="tab-button" onclick="showTab('convert', this)">ID Conversion</button>
             <button class="tab-button" onclick="showTab('compare', this)">Compare Lists</button>
         </div>
@@ -153,14 +164,21 @@
         <!-- Employment Status Tab -->
         <div id="status" class="tab-content">
             <div class="card">
-                <h2>Get Employment Status</h2>
-                <p>Reads IDs from column <select id="status-read-column" class="column-select">
-                    <option value="0">A</option><option value="1">B</option><option value="2">C</option><option value="3">D</option><option value="4" selected>E</option><option value="5">F</option><option value="6">G</option><option value="7">H</option><option value="8">I</option><option value="9">J</option><option value="10">K</option><option value="11">L</option><option value="12">M</option><option value="13">N</option><option value="14">O</option><option value="15">P</option><option value="16">Q</option><option value="17">R</option><option value="18">S</option><option value="19">T</option><option value="20">U</option><option value="21">V</option><option value="22">W</option><option value="23">X</option><option value="24">Y</option><option value="25">Z</option>
-                </select>, writes status to column <select id="status-write-column" class="column-select">
-                    <option value="A">A</option><option value="B">B</option><option value="C">C</option><option value="D">D</option><option value="E">E</option><option value="F">F</option><option value="G" selected>G</option><option value="H">H</option><option value="I">I</option><option value="J">J</option><option value="K">K</option><option value="L">L</option><option value="M">M</option><option value="N">N</option><option value="O">O</option><option value="P">P</option><option value="Q">Q</option><option value="R">R</option><option value="S">S</option><option value="T">T</option><option value="U">U</option><option value="V">V</option><option value="W">W</option><option value="X">X</option><option value="Y">Y</option><option value="Z">Z</option>
-                </select> and source to column <select id="status-source-column" class="column-select">
-                    <option value="A">A</option><option value="B">B</option><option value="C">C</option><option value="D">D</option><option value="E">E</option><option value="F">F</option><option value="G">G</option><option value="H" selected>H</option><option value="I">I</option><option value="J">J</option><option value="K">K</option><option value="L">L</option><option value="M">M</option><option value="N">N</option><option value="O">O</option><option value="P">P</option><option value="Q">Q</option><option value="R">R</option><option value="S">S</option><option value="T">T</option><option value="U">U</option><option value="V">V</option><option value="W">W</option><option value="X">X</option><option value="Y">Y</option><option value="Z">Z</option>
-                </select></p>
+                <h2>Statuses</h2>
+                <p class="convert-sentence" id="status-sentence" style="position:relative;z-index:10001;">
+                    Reads IDs from column <select id="status-read-column" class="column-select">
+                        <option value="0">A</option><option value="1">B</option><option value="2">C</option><option value="3">D</option><option value="4" selected>E</option><option value="5">F</option><option value="6">G</option><option value="7">H</option><option value="8">I</option><option value="9">J</option><option value="10">K</option><option value="11">L</option><option value="12">M</option><option value="13">N</option><option value="14">O</option><option value="15">P</option><option value="16">Q</option><option value="17">R</option><option value="18">S</option><option value="19">T</option><option value="20">U</option><option value="21">V</option><option value="22">W</option><option value="23">X</option><option value="24">Y</option><option value="25">Z</option>
+                    </select>
+                    <span id="status-writes-prefix">and writes </span><span id="status-writes-inline"></span><span class="convert-writes-sep" id="status-writes-sep"></span> .
+                </p>
+                <div class="convert-add-row" id="status-type-wrapper" style="position:relative;z-index:10002;">
+                    <button type="button" id="status-add-type-btn" class="convert-add-type-btn" style="pointer-events:auto;cursor:pointer;position:relative;z-index:10003;" onclick="window.toggleStatusAddType && window.toggleStatusAddType(event); return false;">Add field to get ▼</button>
+                    <div id="status-type-dropdown" class="convert-type-dropdown" role="listbox" aria-hidden="true" style="display: none;">
+                        <button type="button" role="option" data-type="SOURCE_SYSTEM">Source System</button>
+                        <button type="button" role="option" data-type="EMPLOYMENT_STATUS">Employment Status</button>
+                        <button type="button" role="option" data-type="STUDENT_STATUS_CODE">Student Status Code</button>
+                    </div>
+                </div>
                 <div id="status-connection-status" class="connection-indicator" style="margin-bottom: 15px; padding: 10px; border-radius: 5px; background: #f0f0f0;">
                     <span id="status-sheet-indicator">⚪ No sheet connected</span>
                 </div>
@@ -295,6 +313,48 @@
                     dd.style.display = 'none';
                     btn.setAttribute('aria-expanded', 'false');
                     dd.setAttribute('aria-hidden', 'true');
+                }
+            });
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', setup);
+        } else {
+            setup();
+        }
+    })();
+    (function initStatusDropdownInline() {
+        function setup() {
+            var wrapper = document.getElementById('status-type-wrapper');
+            var btn = document.getElementById('status-add-type-btn');
+            var dd = document.getElementById('status-type-dropdown');
+            if (!wrapper || !dd || !btn) return;
+            function closeDropdown() {
+                dd.classList.remove('open');
+                dd.style.display = 'none';
+                btn.setAttribute('aria-expanded', 'false');
+                dd.setAttribute('aria-hidden', 'true');
+            }
+            dd.querySelectorAll('button[role="option"]').forEach(function(opt) {
+                opt.addEventListener('click', function(ev) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    var type = this.getAttribute('data-type');
+                    if (typeof statusToSelections !== 'undefined' && type) {
+                        if (!statusToSelections.some(function(s) { return s.type === type; })) {
+                            statusToSelections.push({
+                                type: type,
+                                label: (typeof STATUS_FIELD_LABELS !== 'undefined' ? STATUS_FIELD_LABELS[type] : type),
+                                column: (typeof getNextDefaultStatusColumn === 'function' ? getNextDefaultStatusColumn() : 'G')
+                            });
+                            if (typeof renderStatusWritesList === 'function') renderStatusWritesList();
+                        }
+                    }
+                    closeDropdown();
+                });
+            });
+            document.addEventListener('click', function(ev) {
+                if (dd.classList.contains('open') && !wrapper.contains(ev.target)) {
+                    closeDropdown();
                 }
             });
         }
