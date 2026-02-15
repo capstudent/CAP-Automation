@@ -1380,13 +1380,13 @@ class AutomationService:
                             select_element = Select(self.driver.find_element(By.NAME, "exp_reason"))
                             current_reason_elem = select_element.first_selected_option
                             current_reason = (current_reason_elem.text or "").strip()
-                                if current_reason and current_reason.lower() != "select a reason":
-                                    result['error'] = f"Privilege already {current_reason}"
-                                    result['success'] = True
-                                    self.driver.find_element(By.LINK_TEXT, "People").click()
-                                    time.sleep(3)
-                                    privilege_found = True
-                                    break
+                            if current_reason and current_reason.lower() != "select a reason":
+                                result['error'] = f"Privilege already {current_reason}"
+                                result['success'] = True
+                                self.driver.find_element(By.LINK_TEXT, "People").click()
+                                time.sleep(3)
+                                privilege_found = True
+                                break
                             
                             # Set expiration reason
                             select_element.select_by_visible_text("Revoked")
