@@ -77,7 +77,7 @@
                 </div>
                 <div class="form-group">
                     <label for="sheet-name">Worksheet Name: <span style="color: red;">*</span></label>
-                    <input type="text" id="sheet-name" placeholder="Adding/Revoking (JS )" required>
+                    <input type="text" id="sheet-name" placeholder="Processing (JS)" required>
                 </div>
                 <button onclick="connectSheetsWithToken()" class="btn btn-primary" id="connect-btn" disabled>Connect to Sheets</button>
                 <div id="sheets-status" class="status-message"></div>
@@ -121,7 +121,7 @@
                 </div>
                 <div class="form-group">
                     <label for="add-performed-by-name">Performed By Name: <span style="color: red;">*</span></label>
-                    <input type="text" id="add-performed-by-name" placeholder="e.g., John Doe" required>
+                    <input type="text" id="add-performed-by-name" placeholder="e.g., Jameel Saeb" required>
                     <small style="color: #666; display: block; margin-top: 4px;">
                         Enter the full name that will appear in the autocomplete field
                     </small>
@@ -144,8 +144,8 @@
                     <span id="revoke-sheet-indicator">⚪ No sheet connected</span>
                 </div>
                 <div class="form-group">
-                    <label for="revoke-app-name">Application Name:</label>
-                    <input type="text" id="revoke-app-name" placeholder="SLATE">
+                    <label for="revoke-app-name">Application Code:</label>
+                    <input type="text" id="revoke-app-name" placeholder="HURIRB">
                 </div>
                 <div class="form-group">
                     <label for="revoke-comment">Comment:</label>
@@ -191,7 +191,6 @@
                     <select id="status-id-type">
                         <option value="SID">Short ID (SID)</option>
                         <option value="BID">Brown ID (BID)</option>
-                        <option value="N">Name</option>
                     </select>
                 </div>
                 <button onclick="getEmploymentStatus()" class="btn btn-primary" id="status-start-btn">Get Status</button>
