@@ -1003,8 +1003,9 @@ class AutomationService:
                     
                     time.sleep(2)
                     
-                    # Extract Employment Source (for Banner-specific logic)
+                    # Extract Employment Source (for Banner/OIM-specific logic)
                     employment_source = ""
+                    oim_date = None
                     try:
                         source_selectors = [
                             (By.XPATH, "//label[@class='col-xs-6' and contains(text(), 'Source')]/following-sibling::div[@class='col-xs-6']"),
@@ -1021,6 +1022,26 @@ class AutomationService:
                                 continue
                     except Exception as e:
                         print(f"  ⚠️  Could not extract Employment Source: {str(e)[:80]}")
+                    
+                    # If OIM: click Affiliate, grab date, then go to AdminID - Current
+                    is_oim = employment_source and ("OIM" in employment_source or "Oracle Identity Manager" in employment_source)
+                    if is_oim:
+                        print(f"  📋 Employment Source is OIM - clicking Affiliate to grab date")
+                        oim_date = None
+                        try:
+                            affiliate_btn = self.driver.find_element(By.LINK_TEXT, "Affiliate")
+                            affiliate_btn.click()
+                            time.sleep(2)
+                            oim_date_xpath = "/html/body/div[1]/div/div[2]/div[3]/form/div[11]/div/div[4]/div[2]/div/div/div"
+                            oim_date_elem = WebDriverWait(self.driver, 5).until(
+                                EC.presence_of_element_located((By.XPATH, oim_date_xpath))
+                            )
+                            raw = (oim_date_elem.text or oim_date_elem.get_attribute("innerText") or oim_date_elem.get_attribute("textContent") or "").strip()
+                            if raw:
+                                oim_date = raw
+                            print(f"  ✅ Grabbed OIM date from Affiliate: '{oim_date}'")
+                        except Exception as e:
+                            print(f"  ⚠️  Could not grab OIM date from Affiliate: {e}")
                     
                     # Navigate to AdminID - Current
                     button = self.driver.find_element(By.LINK_TEXT, "AdminID - Current")
@@ -1246,31 +1267,70 @@ class AutomationService:
                             time.sleep(0.5)
                         except Exception as e:
                             print(f"  ⚠️  Could not set attn_type/attn_date (Banner): {str(e)[:100]}")
+                    elif is_oim:
+                        if not oim_date or not str(oim_date).strip():
+                            result['success'] = False
+                            result['error'] = "Could not get date from Affiliate page"
+                            print(f"  ❌ OIM: Affiliate date empty - skipping privilege add, reporting error")
+                            try:
+                                self.driver.find_element(By.LINK_TEXT, "People").click()
+                                time.sleep(3)
+                            except Exception:
+                                pass
+                        else:
+                            print(f"  📋 Employment Source is OIM - setting attn_type (End Date) and attn_date from Affiliate")
+                            attn_date_str = str(oim_date).strip()
+                            try:
+                                attn_type_elem = WebDriverWait(self.driver, 5).until(
+                                    EC.presence_of_element_located((By.XPATH, "//*[@id='attn_type']"))
+                                )
+                                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", attn_type_elem)
+                                time.sleep(0.5)
+                                try:
+                                    Select(attn_type_elem).select_by_visible_text("End Date")
+                                except Exception:
+                                    attn_type_elem.click()
+                                    time.sleep(0.5)
+                                    for opt in self.driver.find_elements(By.XPATH, "//*[@id='attn_type']/option"):
+                                        if "End Date" in (opt.text or ""):
+                                            opt.click()
+                                            break
+                                print(f"  ✅ Selected attn_type: End Date")
+                                time.sleep(0.5)
+                                
+                                attn_date_elem = self.driver.find_element(By.XPATH, "//*[@id='attn_date']")
+                                attn_date_elem.clear()
+                                attn_date_elem.send_keys(attn_date_str)
+                                print(f"  ✅ Set attn_date to {attn_date_str} (from Affiliate)")
+                                time.sleep(0.5)
+                            except Exception as e:
+                                print(f"  ⚠️  Could not set attn_type/attn_date (OIM): {e}")
                     else:
-                        print(f"  📋 Employment Source is not Banner - skipping attn_type/attn_date")
+                        print(f"  📋 Employment Source is not Banner/OIM - skipping attn_type/attn_date")
                     
-                    # Add comment
-                    textarea = self.driver.find_element(By.NAME, "comments")
-                    existing_text = textarea.get_attribute("value") or ""
-                    new_text = (existing_text + " " + comment).strip() if comment else existing_text
-                    textarea.clear()
-                    textarea.send_keys(new_text)
-                    
-                    # Save
-                    submit_button = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, '//button[@type="submit" and text()="Save"]'))
-                    )
-                    submit_button.click()
-                    time.sleep(2)
-                    
-                    # Return to People page
-                    people_button = self.driver.find_element(
-                        By.XPATH,
-                        "//a[@class='selected' and contains(text(), 'People')]"
-                    )
-                    people_button.click()
-                    
-                    result['success'] = True
+                    if result.get('error') != "Could not get date from Affiliate page":
+                        # Add comment
+                        textarea = self.driver.find_element(By.NAME, "comments")
+                        existing_text = textarea.get_attribute("value") or ""
+                        new_text = (existing_text + " " + comment).strip() if comment else existing_text
+                        textarea.clear()
+                        textarea.send_keys(new_text)
+                        
+                        # Save
+                        submit_button = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.XPATH, '//button[@type="submit" and text()="Save"]'))
+                        )
+                        submit_button.click()
+                        time.sleep(2)
+                        
+                        # Return to People page
+                        people_button = self.driver.find_element(
+                            By.XPATH,
+                            "//a[@class='selected' and contains(text(), 'People')]"
+                        )
+                        people_button.click()
+                        
+                        result['success'] = True
                 except OperationAbortedException:
                     raise
                 except Exception as e:
