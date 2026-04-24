@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, send_from_directory
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os
 import sys
 import json
 import re
+import uuid
 
 # Add parent directory to path for imports
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,29 +13,51 @@ sys.path.append(_BASE_DIR)
 FRONTEND_DIR = os.path.join(_BASE_DIR, 'frontend')
 
 from config import Config
-from backend.automation_service import AutomationService
-from backend.sheets_service import SheetsService
-
-app = Flask(__name__)
-CORS(app, supports_credentials=True)  # Enable CORS for frontend with credentials
-app.config['SECRET_KEY'] = Config().SECRET_KEY
+from backend.session_manager import SessionManager
 
 config = Config()
+IS_PRODUCTION = config.FLASK_ENV == 'production'
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = config.SECRET_KEY
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+# Require HTTPS for the session cookie in production so it can't leak over plain HTTP.
+app.config['SESSION_COOKIE_SECURE'] = IS_PRODUCTION
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+
+# When behind a reverse proxy (Railway/Render/nginx/Caddy), trust the X-Forwarded-*
+# headers so Flask knows the real scheme (https) and host. This is required for
+# Google OAuth redirect URIs to be generated with https:// when terminating TLS
+# at the proxy layer.
+if IS_PRODUCTION:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+CORS(app, supports_credentials=True)  # Enable CORS for frontend with credentials
 
 # Store OAuth credentials in memory (in production, use Redis or database)
 oauth_credentials_store = {}
 
-# Initialize services (will be authenticated per request)
-sheets_service = SheetsService(config)
-automation_service = AutomationService(config, sheets_service)
+# Per-user sessions: each user gets their own sheets_service and automation_service
+session_manager = SessionManager(config, max_sessions=10, idle_timeout_seconds=1800)
 
-def authenticate_sheets_service(data):
-    """Helper function to authenticate sheets service from request data"""
+
+def _get_user_session():
+    """Get (or create) the UserSession for the current Flask session.
+
+    Raises if server is at capacity.
+    """
+    if 'sid' not in session:
+        session['sid'] = str(uuid.uuid4())
+        session.permanent = False
+    return session_manager.get_or_create(session['sid'])
+
+
+def authenticate_sheets_service(sheets_service, data):
+    """Authenticate the given sheets_service using credentials in request data."""
     oauth_state = data.get('oauth_state')
     service_account_file = data.get('service_account_file')
     service_account_json = data.get('service_account_json')
-    
-    # Authenticate - OAuth first, then service account
+
     if oauth_state:
         if oauth_state not in oauth_credentials_store or 'credentials' not in oauth_credentials_store[oauth_state]:
             raise Exception('OAuth credentials not found. Please authorize again.')
@@ -44,7 +68,7 @@ def authenticate_sheets_service(data):
     elif not sheets_service.gc:
         try:
             sheets_service.authenticate()
-        except:
+        except Exception:
             raise Exception('Google authentication required. Please use OAuth or provide service account credentials.')
 
 @app.route('/api/health', methods=['GET'])
@@ -89,18 +113,18 @@ def exchange_token():
         data = request.json
         credential = data.get('credential')
         frontend_url = data.get('frontend_url')  # Get frontend URL from request
-        
+
         if not credential:
             return jsonify({'success': False, 'error': 'Credential required'}), 400
-        
-        if not config.GOOGLE_CLIENT_ID:
-            return jsonify({'success': False, 'error': 'OAuth not configured on server'}), 500
-        
+
+        if not config.GOOGLE_CLIENT_ID or not config.GOOGLE_CLIENT_SECRET:
+            return jsonify({'success': False, 'error': 'OAuth is not configured on the server.'}), 500
+
         # Verify the JWT token
         try:
             idinfo = id_token.verify_oauth2_token(
-                credential, 
-                requests.Request(), 
+                credential,
+                requests.Request(),
                 config.GOOGLE_CLIENT_ID
             )
         except ValueError as e:
@@ -130,7 +154,7 @@ def exchange_token():
         print(f"=== OAuth Exchange Token ===")
         print(f"GOOGLE_CLIENT_ID: {config.GOOGLE_CLIENT_ID[:20]}..." if config.GOOGLE_CLIENT_ID else None)
         print(f"GOOGLE_REDIRECT_URI: {config.GOOGLE_REDIRECT_URI}")
-        
+
         scopes = [
             'openid',
             'https://www.googleapis.com/auth/userinfo.email',
@@ -138,7 +162,7 @@ def exchange_token():
             'https://www.googleapis.com/auth/spreadsheets',
             'https://www.googleapis.com/auth/drive.readonly'
         ]
-        
+
         client_config = {
             "web": {
                 "client_id": config.GOOGLE_CLIENT_ID,
@@ -148,7 +172,7 @@ def exchange_token():
                 "redirect_uris": [config.GOOGLE_REDIRECT_URI]
             }
         }
-        
+
         flow = Flow.from_client_config(
             client_config,
             scopes=scopes,
@@ -402,20 +426,23 @@ def oauth_callback():
 def use_oauth_credentials():
     """Use stored OAuth credentials to authenticate"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+
         data = request.json
         state = data.get('state')
-        
+
         if not state or state not in oauth_credentials_store:
             return jsonify({'success': False, 'error': 'Invalid state. Please authorize again.'}), 400
-        
+
         stored = oauth_credentials_store[state]
         if 'credentials' not in stored:
             return jsonify({'success': False, 'error': 'Credentials not found. Please authorize again.'}), 400
-        
+
         # Use credentials to authenticate
         creds_dict = stored['credentials']
         sheets_service.authenticate_with_oauth(creds_dict)
-        
+
         return jsonify({'success': True, 'message': 'Authenticated successfully'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -424,6 +451,9 @@ def use_oauth_credentials():
 def connect_sheets():
     """Connect to Google Sheets"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -491,6 +521,9 @@ def connect_sheets():
 def login():
     """Login to myaccount.brown.edu"""
     try:
+        user_session = _get_user_session()
+        automation_service = user_session.automation_service
+
         data = request.json
         username = data.get('username') or config.MYACCOUNT_USERNAME
         password = data.get('password') or config.MYACCOUNT_PASSWORD
@@ -512,21 +545,26 @@ def login():
     except Exception as e:
         error_msg = str(e)
         print(f"Login error: {error_msg}")
-        
+
         # If it's a driver connection error, cleanup and provide better error message
         if "disconnected" in error_msg.lower() or "unable to connect" in error_msg.lower():
-            automation_service._cleanup_driver()
+            try:
+                user_session.automation_service._cleanup_driver()
+            except Exception:
+                pass
             return jsonify({
-                'success': False, 
+                'success': False,
                 'error': 'Browser connection lost. Please try logging in again.'
             }), 500
-        
+
         return jsonify({'success': False, 'error': error_msg}), 500
 
 @app.route('/api/automation/abort', methods=['POST'])
 def abort_automation():
     """Abort the current automation task. Navigator returns to myaccount."""
     try:
+        user_session = _get_user_session()
+        automation_service = user_session.automation_service
         automation_service.abort()
         return jsonify({'success': True, 'message': 'Abort requested. Task will stop after current item.'})
     except Exception as e:
@@ -536,9 +574,13 @@ def abort_automation():
 def add_privileges():
     """Add privileges to users - reads from Google Sheets column E (index 4)"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+        automation_service = user_session.automation_service
+
         data = request.json
         print(f"📋 Received request data: {data}")  # Debug logging
-        
+
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
         app_name = data.get('app_name', 'Slate [SLATE]')
@@ -548,34 +590,34 @@ def add_privileges():
         oauth_state = data.get('oauth_state')
         service_account_file = data.get('service_account_file')
         service_account_json = data.get('service_account_json')
-        
+
         print(f"🔍 performed_by_name value: '{performed_by_name}'")  # Debug logging
-        
+
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
-        
+
         if not performed_by_name:
             return jsonify({'success': False, 'error': 'Performed By Name is required'}), 400
-        
+
         # Authenticate
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
-        
+
         # Connect to sheet and get IDs from column
         worksheet = sheets_service.connect(sheet_url, sheet_name)
         columns = sheets_service.get_columns(worksheet)
-        
+
         if column_index >= len(columns):
             return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
-        
+
         # Get IDs from column (skip header row)
         ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
-        
+
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs found in the specified column'}), 400
-        
+
         results = automation_service.add_privileges(ids, app_name, comment, performed_by_name)
         
         return jsonify({
@@ -591,6 +633,10 @@ def add_privileges():
 def revoke_privileges():
     """Revoke privileges from users - reads from Google Sheets column F (index 5)"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+        automation_service = user_session.automation_service
+
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -599,26 +645,26 @@ def revoke_privileges():
         column_index = data.get('column_index', 5)  # Column F (index 5)
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
-        
+
         # Authenticate
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
-        
+
         # Connect to sheet and get IDs from column
         worksheet = sheets_service.connect(sheet_url, sheet_name)
         columns = sheets_service.get_columns(worksheet)
-        
+
         if column_index >= len(columns):
             return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
-        
+
         # Get IDs from column (skip header row)
         ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
-        
+
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs found in the specified column'}), 400
-        
+
         results = automation_service.revoke_privileges(ids, app_name, comment)
         
         return jsonify({
@@ -645,6 +691,10 @@ STATUS_FIELD_HEADERS = {
 def get_employment_status():
     """Get status fields (Source System, Employment Status, Student Status Code) - writes to Google Sheets"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+        automation_service = user_session.automation_service
+
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -658,7 +708,7 @@ def get_employment_status():
         if not to_fields or not write_columns:
             return jsonify({'success': False, 'error': 'Select at least one field to get and a column for each'}), 400
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
         worksheet = sheets_service.connect(sheet_url, sheet_name)
@@ -709,6 +759,10 @@ def get_employment_status():
 def convert_id():
     """Convert between ID types (Net ID to SID, Brown ID to SID)"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+        automation_service = user_session.automation_service
+
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -717,13 +771,13 @@ def convert_id():
         to_types = data.get('to_types', ['SID'])
         write_columns = data.get('write_columns', {'SID': 'B'})
         column_index = data.get('column_index', 0)
-        
+
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
-        
+
         # Authenticate
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
         
@@ -804,6 +858,10 @@ def convert_id():
 def convert_validation():
     """Validate MyAccount search results against a selected sheet column and color cells."""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+        automation_service = user_session.automation_service
+
         data = request.json or {}
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -837,7 +895,7 @@ def convert_validation():
             return jsonify({'success': False, 'error': 'data_start_row must be >= 1'}), 400
 
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
 
@@ -1046,6 +1104,9 @@ def convert_validation():
 def compare_lists():
     """Compare two lists to find who to add and remove"""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+
         data = request.json
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -1055,13 +1116,13 @@ def compare_lists():
         column2_index = data.get('column2_index', 1)  # Column B (index 1)
         to_add_column = data.get('to_add_column', 'E')  # Column for "To Add" results
         to_remove_column = data.get('to_remove_column', 'F')  # Column for "To Remove" results
-        
+
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
-        
+
         # Authenticate
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
         
@@ -1119,6 +1180,9 @@ def compare_lists():
 def move_and_shift_columns():
     """Move selected column values to destination columns when conditions match, then compact source columns upward."""
     try:
+        user_session = _get_user_session()
+        sheets_service = user_session.sheets_service
+
         data = request.json or {}
         sheet_url = data.get('sheet_url')
         sheet_name = data.get('sheet_name')
@@ -1186,7 +1250,7 @@ def move_and_shift_columns():
             return jsonify({'success': False, 'error': 'At least one condition is required'}), 400
 
         try:
-            authenticate_sheets_service(data)
+            authenticate_sheets_service(sheets_service, data)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
 
@@ -1299,9 +1363,12 @@ def move_and_shift_columns():
 
 @app.route('/api/automation/logout', methods=['POST'])
 def logout():
-    """Logout and close browser"""
+    """Logout and close browser, and drop this user's session."""
     try:
-        automation_service.logout()
+        sid = session.get('sid')
+        if sid:
+            session_manager.remove(sid)
+            session.pop('sid', None)
         return jsonify({'success': True, 'message': 'Logged out successfully'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

@@ -1,5 +1,9 @@
 // Version: 2026-01-17-v1 - Added column selection dropdowns, abort support
-const API_BASE_URL = 'http://localhost:5001/api';
+// Use the same origin as the page when served by Flask (production); fall back to
+// localhost:5001 when opening index.html directly from disk during development.
+const API_BASE_URL = (window.location.protocol === 'file:' || !window.location.origin)
+    ? 'http://localhost:5001/api'
+    : `${window.location.origin}/api`;
 
 // Show/hide Start and Abort buttons during long-running operations
 function setOperationRunning(tab, running) {
@@ -145,7 +149,7 @@ window.addEventListener('load', function() {
         window.history.replaceState({}, document.title, window.location.pathname);
     }
     
-    // Get client ID from backend or use default
+    // Get client ID from backend
     fetch(`${API_BASE_URL}/sheets/oauth/client-id`)
         .then(response => response.json())
         .then(data => {
@@ -153,25 +157,15 @@ window.addEventListener('load', function() {
                 googleClientId = data.client_id;
                 initializeGoogleSignIn(data.client_id);
             } else {
-                // Show button area with helpful message
                 const buttonContainer = document.getElementById('g_id_signin');
                 if (buttonContainer) {
                     buttonContainer.innerHTML = `
-                        <div style="padding: 20px; border: 2px dashed #ccc; border-radius: 8px; background: #f9f9f9;">
-                            <p style="margin: 0 0 10px 0; color: #666;"><strong>Google Sign-In Not Configured</strong></p>
-                            <p style="margin: 0 0 15px 0; color: #666; font-size: 0.9em;">
-                                To enable Google Sign-In, please set <code>GOOGLE_CLIENT_ID</code> in your <code>.env</code> file.
-                            </p>
-                            <p style="margin: 0; font-size: 0.85em; color: #888;">
-                                Get your Client ID from: 
-                                <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: #667eea;">
-                                    Google Cloud Console
-                                </a>
-                            </p>
+                        <div style="padding: 16px; border: 2px dashed #f4b400; border-radius: 8px; background: #fffde7;">
+                            <p style="margin: 0; color: #555;">Google Sign-In is temporarily unavailable. Please try again later.</p>
                         </div>
                     `;
                 }
-                showStatus('oauth-status', 'OAuth not configured. Please set GOOGLE_CLIENT_ID in .env file. See instructions above.', 'error');
+                showStatus('oauth-status', 'Google Sign-In is temporarily unavailable. Please try again later.', 'error');
             }
         })
         .catch(error => {
@@ -180,11 +174,11 @@ window.addEventListener('load', function() {
             if (buttonContainer) {
                 buttonContainer.innerHTML = `
                     <div style="padding: 20px; border: 2px dashed #ccc; border-radius: 8px; background: #f9f9f9;">
-                        <p style="margin: 0; color: #666;">Could not connect to server. Please make sure the backend is running.</p>
+                        <p style="margin: 0; color: #666;">Could not reach the server. Please try again later.</p>
                     </div>
                 `;
             }
-            showStatus('oauth-status', 'Could not initialize Google Sign-In. Please check server configuration.', 'error');
+            showStatus('oauth-status', 'Could not reach the server. Please try again later.', 'error');
         });
 });
 
@@ -254,6 +248,7 @@ async function exchangeTokenForAccess(credential) {
         }
         const frontendUrl = window.location.origin + pathname;
         console.log('Sending frontend URL to backend:', frontendUrl);
+
         const result = await apiCall('/sheets/oauth/exchange-token', 'POST', {
             credential: credential,
             frontend_url: frontendUrl

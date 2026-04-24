@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: oit-automation
+    runtime: docker
+    plan: free
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: SELENIUM_HEADLESS
+        value: "true"
+      - key: SECRET_KEY
+        generateValue: true
+      # Set these three in the Render dashboard after first deploy
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false

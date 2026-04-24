@@ -79,11 +79,12 @@ class AutomationService:
             return self.driver
         
         chrome_options = Options()
-        
-        # Headless mode for server environments
-        # Set to False if you want to see the browser (useful for debugging)
-        # TEMPORARILY DISABLED for Duo debugging
-        # chrome_options.add_argument('--headless=new')
+
+        # Headless mode is controlled by SELENIUM_HEADLESS env var.
+        # Defaults: headless in production, visible in development.
+        if getattr(self.config, 'SELENIUM_HEADLESS', False):
+            print("🤖 Running Chrome in headless mode")
+            chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')

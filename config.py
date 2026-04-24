@@ -23,3 +23,10 @@ class Config:
     PORT = int(os.getenv('PORT', 5001))
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
 
+    # Selenium: set to "true" on servers where no display is available.
+    # Defaults to headless in production, visible in development.
+    SELENIUM_HEADLESS = os.getenv(
+        'SELENIUM_HEADLESS',
+        'true' if FLASK_ENV == 'production' else 'false'
+    ).lower() == 'true'
+
