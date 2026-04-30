@@ -85,6 +85,10 @@ class AutomationService:
         if getattr(self.config, 'SELENIUM_HEADLESS', False):
             print("🤖 Running Chrome in headless mode")
             chrome_options.add_argument('--headless=new')
+        # Force a desktop-sized window so MyAccount renders its desktop layout
+        # (same XPaths work in both headed and headless) and the autocomplete
+        # dropdown positions correctly within the viewport.
+        chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
@@ -1545,12 +1549,20 @@ class AutomationService:
                     search_button = self.driver.find_element(By.NAME, "search")
                     if id_type == 'BID':
                         text_box = self.driver.find_element(By.ID, "brown_id")
+                        send_value = user_id
+                    elif id_type == 'BROWN_EMAIL':
+                        # Mirror the convert_ids / run_conversion_validation logic:
+                        # strip '@brown.edu' and search by netid in the brown_netid field.
+                        text_box = self.driver.find_element(By.NAME, "brown_netid")
+                        send_value = user_id.replace('@brown.edu', '').strip()
                     elif id_type == 'SID':
                         text_box = self.driver.find_element(By.NAME, "brown_login")
+                        send_value = user_id
                     else:
                         text_box = self.driver.find_element(By.NAME, "brown_login")
+                        send_value = user_id
                     text_box.clear()
-                    text_box.send_keys(user_id)
+                    text_box.send_keys(send_value)
                     time.sleep(2)
                     search_button.click()
                     time.sleep(3)
