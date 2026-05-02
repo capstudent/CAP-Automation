@@ -18,6 +18,8 @@ function setOperationRunning(tab, running) {
 }
 
 async function abortAutomation(tab) {
+    // Set the global JS abort flag so the chunk loop stops between chunks too.
+    window._chunkAbortRequested = true;
     try {
         await apiCall('/automation/abort', 'POST');
         showStatus(`${tab}-status`, 'Abort requested. Stopping after current item...', 'info');
@@ -25,6 +27,82 @@ async function abortAutomation(tab) {
         showStatus(`${tab}-status`, `Abort failed: ${error.message}`, 'error');
     }
 }
+
+// Process a list of items in chunks to avoid Render's HTTP request timeout.
+// Each chunk is a separate API call; results are aggregated. Aborts between chunks.
+//   items         - array of items to process
+//   chunkSize     - max items per API call (default 25)
+//   runChunkFn    - async (chunk, chunkIndex, totalChunks) => { results, successful, ... }
+//   options       - { statusElementId, label, onChunkDone }
+async function runChunked(items, chunkSize, runChunkFn, options = {}) {
+    const total = items.length;
+    const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
+    const allResults = [];
+    let totalSuccessful = 0;
+    window._chunkAbortRequested = false;
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (window._chunkAbortRequested) {
+            if (options.statusElementId) {
+                showStatus(options.statusElementId,
+                    `Aborted after chunk ${chunkIndex}/${totalChunks} (${allResults.length}/${total} processed)`,
+                    'info');
+            }
+            break;
+        }
+
+        const start = chunkIndex * chunkSize;
+        const chunk = items.slice(start, start + chunkSize);
+        const label = options.label || 'items';
+
+        if (options.statusElementId) {
+            showStatus(options.statusElementId,
+                `Processing chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} ${label}, ${allResults.length}/${total} done)...`,
+                'info');
+        }
+
+        let chunkResult;
+        try {
+            chunkResult = await runChunkFn(chunk, chunkIndex, totalChunks);
+        } catch (e) {
+            const msg = `Failed at chunk ${chunkIndex + 1}/${totalChunks} (${allResults.length}/${total} done before failure): ${e.message}`;
+            if (options.statusElementId) showStatus(options.statusElementId, msg, 'error');
+            return { results: allResults, successful: totalSuccessful, total, error: e, chunksCompleted: chunkIndex };
+        }
+
+        if (chunkResult && Array.isArray(chunkResult.results)) {
+            allResults.push(...chunkResult.results);
+        }
+        if (chunkResult && typeof chunkResult.successful === 'number') {
+            totalSuccessful += chunkResult.successful;
+        }
+        if (options.onChunkDone) {
+            try { options.onChunkDone(chunkIndex, totalChunks, chunkResult); } catch {}
+        }
+    }
+
+    return { results: allResults, successful: totalSuccessful, total, chunksCompleted: totalChunks };
+}
+
+// Fetch a single sheet column as an array of trimmed, non-empty strings (skips header row).
+async function fetchSheetColumn(sheetUrl, sheetName, columnIndex, oauthState) {
+    const result = await apiCall('/sheets/connect', 'POST', {
+        sheet_url: sheetUrl,
+        sheet_name: sheetName,
+        oauth_state: oauthState
+    });
+    if (!result || !result.success) {
+        throw new Error(result?.error || 'Could not read sheet');
+    }
+    const columns = result.columns || [];
+    if (columnIndex >= columns.length) {
+        throw new Error(`Column index ${columnIndex} not found (sheet has ${columns.length} columns)`);
+    }
+    const col = columns[columnIndex] || [];
+    return col.slice(1).map(v => (v || '').toString().trim()).filter(Boolean);
+}
+
+const CHUNK_SIZE = 25;
 
 // Google OAuth token storage
 let googleAccessToken = null;
@@ -622,53 +700,52 @@ async function login() {
 
 // Add privileges
 async function addPrivileges() {
-    // Get sheet info from global connection
     const sheetInfo = requireSheetConnection('add-status');
     if (!sheetInfo) return;
-    
+
     const appName = document.getElementById('add-app-name').value;
     const comment = document.getElementById('add-comment').value.trim();
     const performedByName = document.getElementById('add-performed-by-name').value;
     const columnIndex = parseInt(document.getElementById('add-read-column').value);
-    
+
     if (!performedByName || performedByName.trim() === '') {
         showStatus('add-status', 'Please provide a Performed By Name', 'error');
         return;
     }
-    
+
     clearStatus('add-status');
     clearResults('add-results');
-    showStatus('add-status', 'Refreshing sheet data and processing...', 'info');
-    setOperationRunning('add', true);  // Show abort button immediately
-    
+    showStatus('add-status', 'Reading IDs from sheet...', 'info');
+    setOperationRunning('add', true);
+
     try {
         const oauthState = getOAuthState();
-        
-        // First, refresh the sheet connection to get latest data
-        await apiCall('/sheets/connect', 'POST', {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            oauth_state: oauthState
-        });
-        
-        const requestData = {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            app_name: appName,
-            comment: comment,
-            performed_by_name: performedByName.trim(),
-            column_index: columnIndex,
-            oauth_state: oauthState
-        };
-        
-        const result = await apiCall('/automation/add', 'POST', requestData);
-        
-        showStatus('add-status', 
-            `Completed: ${result.successful} successful out of ${result.total}`, 
-            result.successful === result.total ? 'success' : 'info'
-        );
-        
-        showResults('add-results', result.results, formatAddResults);
+        const ids = await fetchSheetColumn(sheetInfo.url, sheetInfo.name, columnIndex, oauthState);
+        if (ids.length === 0) {
+            showStatus('add-status', 'No IDs found in the selected column', 'error');
+            return;
+        }
+
+        const summary = await runChunked(ids, CHUNK_SIZE, async (chunk) => {
+            return await apiCall('/automation/add', 'POST', {
+                sheet_url: sheetInfo.url,
+                sheet_name: sheetInfo.name,
+                app_name: appName,
+                comment: comment,
+                performed_by_name: performedByName.trim(),
+                column_index: columnIndex,
+                ids: chunk,
+                oauth_state: oauthState
+            });
+        }, { statusElementId: 'add-status', label: 'IDs' });
+
+        if (!summary.error) {
+            showStatus('add-status',
+                `Completed: ${summary.successful} successful out of ${summary.total}`,
+                summary.successful === summary.total ? 'success' : 'info'
+            );
+        }
+        showResults('add-results', summary.results, formatAddResults);
     } catch (error) {
         showStatus('add-status', `Error: ${error.message}`, 'error');
     } finally {
@@ -699,54 +776,49 @@ function formatAddResults(results) {
 
 // Revoke privileges
 async function revokePrivileges() {
-    // Get sheet info from global connection
     const sheetInfo = requireSheetConnection('revoke-status');
-    if (!sheetInfo) {
-        return;
-    }
-    
-    // Refresh sheet data before processing
-    showStatus('revoke-status', 'Refreshing sheet data...', 'info');
-    const refreshed = await refreshSheetConnection();
-    if (!refreshed) {
-        showStatus('revoke-status', 'Failed to refresh sheet connection', 'error');
-        return;
-    }
-    
+    if (!sheetInfo) return;
+
     const appName = document.getElementById('revoke-app-name').value;
     const comment = document.getElementById('revoke-comment').value.trim();
     const columnIndex = parseInt(document.getElementById('revoke-read-column').value);
-    
+
     clearStatus('revoke-status');
     clearResults('revoke-results');
-    showStatus('revoke-status', 'Reading IDs from sheet and processing...', 'info');
-    setOperationRunning('revoke', true);  // Show abort button immediately
-    
+    showStatus('revoke-status', 'Reading IDs from sheet...', 'info');
+    setOperationRunning('revoke', true);
+
     try {
         const serviceAccountData = await getServiceAccountData();
         const oauthState = getOAuthState();
-        const requestData = {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            app_name: appName,
-            comment: comment,
-            column_index: columnIndex
-        };
-        
-        if (oauthState) {
-            requestData.oauth_state = oauthState;
-        } else {
-            Object.assign(requestData, serviceAccountData);
+
+        const ids = await fetchSheetColumn(sheetInfo.url, sheetInfo.name, columnIndex, oauthState);
+        if (ids.length === 0) {
+            showStatus('revoke-status', 'No IDs found in the selected column', 'error');
+            return;
         }
-        
-        const result = await apiCall('/automation/revoke', 'POST', requestData);
-        
-        showStatus('revoke-status', 
-            `Completed: ${result.successful} successful out of ${result.total}`, 
-            result.successful === result.total ? 'success' : 'info'
-        );
-        
-        showResults('revoke-results', result.results, formatRevokeResults);
+
+        const summary = await runChunked(ids, CHUNK_SIZE, async (chunk) => {
+            const requestData = {
+                sheet_url: sheetInfo.url,
+                sheet_name: sheetInfo.name,
+                app_name: appName,
+                comment: comment,
+                column_index: columnIndex,
+                ids: chunk
+            };
+            if (oauthState) requestData.oauth_state = oauthState;
+            else Object.assign(requestData, serviceAccountData);
+            return await apiCall('/automation/revoke', 'POST', requestData);
+        }, { statusElementId: 'revoke-status', label: 'IDs' });
+
+        if (!summary.error) {
+            showStatus('revoke-status',
+                `Completed: ${summary.successful} successful out of ${summary.total}`,
+                summary.successful === summary.total ? 'success' : 'info'
+            );
+        }
+        showResults('revoke-results', summary.results, formatRevokeResults);
     } catch (error) {
         showStatus('revoke-status', `Error: ${error.message}`, 'error');
     } finally {
@@ -778,13 +850,7 @@ async function getEmploymentStatus() {
     const sheetInfo = requireSheetConnection('status-status');
     if (!sheetInfo) return;
     setOperationRunning('status', true);
-    showStatus('status-status', 'Refreshing sheet data...', 'info');
-    const refreshed = await refreshSheetConnection();
-    if (!refreshed) {
-        showStatus('status-status', 'Failed to refresh sheet connection', 'error');
-        setOperationRunning('status', false);
-        return;
-    }
+
     const idsText = document.getElementById('status-ids').value;
     const idType = document.getElementById('status-id-type').value;
     const columnIndex = parseInt(document.getElementById('status-read-column').value);
@@ -803,28 +869,46 @@ async function getEmploymentStatus() {
         setOperationRunning('status', false);
         return;
     }
-    const ids = idsText.trim() ? idsText.split('\n').map(id => id.trim()).filter(id => id) : [];
+
     clearStatus('status-status');
     clearResults('status-results');
-    showStatus('status-status', 'Fetching statuses...', 'info');
+    showStatus('status-status', 'Reading IDs...', 'info');
     try {
         const serviceAccountData = await getServiceAccountData();
         const oauthState = getOAuthState();
-        const requestData = {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            ids: ids.length > 0 ? ids : undefined,
-            id_type: idType,
-            column_index: columnIndex,
-            to_fields: toFields,
-            write_columns: writeColumns
-        };
-        if (oauthState) requestData.oauth_state = oauthState;
-        else Object.assign(requestData, serviceAccountData);
-        const result = await apiCall('/automation/get-employment-status', 'POST', requestData);
-        const colList = toFields.map(f => `${STATUS_FIELD_LABELS[f] || f}→${writeColumns[f]}`).join(', ');
-        showStatus('status-status', `Written to: ${colList}`, 'success');
-        showResults('status-results', result.results, (r) => formatStatusResults(r, toFields));
+
+        // Pull IDs either from the textarea or from the selected sheet column.
+        let ids = idsText.trim() ? idsText.split('\n').map(id => id.trim()).filter(id => id) : [];
+        if (ids.length === 0) {
+            ids = await fetchSheetColumn(sheetInfo.url, sheetInfo.name, columnIndex, oauthState);
+        }
+        if (ids.length === 0) {
+            showStatus('status-status', 'No IDs found (textarea empty and column has no values)', 'error');
+            return;
+        }
+
+        const summary = await runChunked(ids, CHUNK_SIZE, async (chunk, chunkIndex) => {
+            const requestData = {
+                sheet_url: sheetInfo.url,
+                sheet_name: sheetInfo.name,
+                ids: chunk,
+                id_type: idType,
+                column_index: columnIndex,
+                to_fields: toFields,
+                write_columns: writeColumns,
+                row_offset: chunkIndex * CHUNK_SIZE,
+                write_headers: chunkIndex === 0
+            };
+            if (oauthState) requestData.oauth_state = oauthState;
+            else Object.assign(requestData, serviceAccountData);
+            return await apiCall('/automation/get-employment-status', 'POST', requestData);
+        }, { statusElementId: 'status-status', label: 'IDs' });
+
+        if (!summary.error) {
+            const colList = toFields.map(f => `${STATUS_FIELD_LABELS[f] || f}→${writeColumns[f]}`).join(', ');
+            showStatus('status-status', `Done (${summary.results.length}/${summary.total}). Written to: ${colList}`, 'success');
+        }
+        showResults('status-results', summary.results, (r) => formatStatusResults(r, toFields));
     } catch (error) {
         showStatus('status-status', `Error: ${error.message}`, 'error');
     } finally {
@@ -1050,21 +1134,13 @@ if (document.readyState === 'loading') {
 async function convertIds() {
     const sheetInfo = requireSheetConnection('convert-status');
     if (!sheetInfo) return;
-    
-    showStatus('convert-status', 'Refreshing sheet data...', 'info');
-    const refreshed = await refreshSheetConnection();
-    if (!refreshed) {
-        showStatus('convert-status', 'Failed to refresh sheet connection', 'error');
-        return;
-    }
-    
+
     const idsText = document.getElementById('convert-ids').value;
     const fromType = document.getElementById('convert-from-type').value;
     const columnIndex = parseInt(document.getElementById('convert-read-column').value);
     const toTypes = [];
     const writeColumns = {};
-    const chips = document.querySelectorAll('#convert-writes-inline .convert-write-chip');
-    chips.forEach(chip => {
+    document.querySelectorAll('#convert-writes-inline .convert-write-chip').forEach(chip => {
         const type = chip.dataset.type;
         const sel = chip.querySelector('select.convert-chip-col');
         if (type && sel) {
@@ -1073,40 +1149,50 @@ async function convertIds() {
         }
     });
     if (toTypes.length === 0) {
-        showStatus('convert-status', 'Select at least one type to convert to (click “Add type to convert to”).', 'error');
+        showStatus('convert-status', 'Select at least one type to convert to (click "Add type to convert to").', 'error');
         return;
     }
-    const ids = idsText.trim() ? idsText.split('\n').map(id => id.trim()).filter(id => id) : [];
-    
+
     clearStatus('convert-status');
     clearResults('convert-results');
-    showStatus('convert-status', 'Converting IDs...', 'info');
+    showStatus('convert-status', 'Reading IDs...', 'info');
     setOperationRunning('convert', true);
-    
+
     try {
         const serviceAccountData = await getServiceAccountData();
         const oauthState = getOAuthState();
-        const requestData = {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            ids: ids.length > 0 ? ids : undefined,
-            from_type: fromType,
-            to_types: toTypes,
-            write_columns: writeColumns,
-            column_index: columnIndex
-        };
-        
-        if (oauthState) {
-            requestData.oauth_state = oauthState;
-        } else {
-            Object.assign(requestData, serviceAccountData);
+
+        let ids = idsText.trim() ? idsText.split('\n').map(id => id.trim()).filter(id => id) : [];
+        if (ids.length === 0) {
+            ids = await fetchSheetColumn(sheetInfo.url, sheetInfo.name, columnIndex, oauthState);
         }
-        
-        const result = await apiCall('/automation/convert-id', 'POST', requestData);
-        
-        const colList = toTypes.map(t => `${t}→${writeColumns[t]}`).join(', ');
-        showStatus('convert-status', `Conversion completed; written to column(s): ${colList}`, 'success');
-        showResults('convert-results', result.results, (r) => formatConvertResults(r, toTypes));
+        if (ids.length === 0) {
+            showStatus('convert-status', 'No IDs found', 'error');
+            return;
+        }
+
+        const summary = await runChunked(ids, CHUNK_SIZE, async (chunk, chunkIndex) => {
+            const requestData = {
+                sheet_url: sheetInfo.url,
+                sheet_name: sheetInfo.name,
+                ids: chunk,
+                from_type: fromType,
+                to_types: toTypes,
+                write_columns: writeColumns,
+                column_index: columnIndex,
+                row_offset: chunkIndex * CHUNK_SIZE,
+                write_headers: chunkIndex === 0
+            };
+            if (oauthState) requestData.oauth_state = oauthState;
+            else Object.assign(requestData, serviceAccountData);
+            return await apiCall('/automation/convert-id', 'POST', requestData);
+        }, { statusElementId: 'convert-status', label: 'IDs' });
+
+        if (!summary.error) {
+            const colList = toTypes.map(t => `${t}→${writeColumns[t]}`).join(', ');
+            showStatus('convert-status', `Done (${summary.results.length}/${summary.total}). Written to: ${colList}`, 'success');
+        }
+        showResults('convert-results', summary.results, (r) => formatConvertResults(r, toTypes));
     } catch (error) {
         showStatus('convert-status', `Error: ${error.message}`, 'error');
     } finally {
@@ -1117,13 +1203,6 @@ async function convertIds() {
 async function runConvertValidation() {
     const sheetInfo = requireSheetConnection('convert-status');
     if (!sheetInfo) return;
-
-    showStatus('convert-status', 'Refreshing sheet data...', 'info');
-    const refreshed = await refreshSheetConnection();
-    if (!refreshed) {
-        showStatus('convert-status', 'Failed to refresh sheet connection', 'error');
-        return;
-    }
 
     const checkColumn = (document.getElementById('convert-validate-check-column')?.value || 'X').trim().toUpperCase();
     const dataStartRow = parseInt(document.getElementById('convert-validate-data-start-row')?.value || '2', 10);
@@ -1158,34 +1237,71 @@ async function runConvertValidation() {
     clearStatus('convert-status');
     clearResults('convert-results');
     showStatus('convert-status', 'Running validation check...', 'info');
+    window._chunkAbortRequested = false;
 
     try {
         const serviceAccountData = await getServiceAccountData();
         const oauthState = getOAuthState();
 
-        const requestData = {
-            sheet_url: sheetInfo.url,
-            sheet_name: sheetInfo.name,
-            search_mappings: searchMappings,
-            check_column: checkColumn,
-            data_start_row: dataStartRow
-        };
+        // Validation chunks by row range. We don't know the total up front, so we
+        // keep advancing the window until a chunk returns fewer rows than requested.
+        const allResults = [];
+        let totals = { green_source: 0, green_check: 0, red_source: 0, matched: 0 };
+        let chunkIndex = 0;
+        let nextStart = dataStartRow;
 
-        if (oauthState) {
-            requestData.oauth_state = oauthState;
-        } else {
-            Object.assign(requestData, serviceAccountData);
+        while (true) {
+            if (window._chunkAbortRequested) {
+                showStatus('convert-status',
+                    `Aborted after chunk ${chunkIndex} (${allResults.length} rows processed).`,
+                    'info');
+                break;
+            }
+            const endRow = nextStart + CHUNK_SIZE - 1;
+
+            showStatus('convert-status',
+                `Processing chunk ${chunkIndex + 1} (rows ${nextStart}-${endRow}, ${allResults.length} done)...`,
+                'info');
+
+            const requestData = {
+                sheet_url: sheetInfo.url,
+                sheet_name: sheetInfo.name,
+                search_mappings: searchMappings,
+                check_column: checkColumn,
+                data_start_row: nextStart,
+                data_end_row: endRow
+            };
+            if (oauthState) requestData.oauth_state = oauthState;
+            else Object.assign(requestData, serviceAccountData);
+
+            let result;
+            try {
+                result = await apiCall('/automation/convert-validation', 'POST', requestData);
+            } catch (e) {
+                showStatus('convert-status',
+                    `Failed at chunk ${chunkIndex + 1} (${allResults.length} rows done before failure): ${e.message}`,
+                    'error');
+                throw e;
+            }
+
+            const chunkResults = (result && result.results) || [];
+            allResults.push(...chunkResults);
+            totals.green_source += result?.green_source_cells || 0;
+            totals.green_check += result?.green_check_cells || 0;
+            totals.red_source += result?.red_source_cells || 0;
+            totals.matched += result?.matched || 0;
+
+            chunkIndex++;
+            // If this chunk returned fewer rows than its window allowed, we're done.
+            if (chunkResults.length < CHUNK_SIZE) break;
+            nextStart = endRow + 1;
         }
 
-        const result = await apiCall('/automation/convert-validation', 'POST', requestData);
-
-        showStatus(
-            'convert-status',
-            `${result.message} Colored ${result.green_source_cells} source + ${result.green_check_cells} check cells green, ${result.red_source_cells} source cells red.`,
-            'success'
-        );
-
-        showResults('convert-results', result.results, formatConvertValidationResults);
+        showStatus('convert-status',
+            `Validation complete: ${totals.matched} matched, ${allResults.length - totals.matched} unmatched. ` +
+            `Colored ${totals.green_source} source + ${totals.green_check} check cells green, ${totals.red_source} source cells red.`,
+            'success');
+        showResults('convert-results', allResults, formatConvertValidationResults);
     } catch (error) {
         showStatus('convert-status', `Error: ${error.message}`, 'error');
     } finally {

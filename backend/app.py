@@ -605,15 +605,18 @@ def add_privileges():
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
 
-        # Connect to sheet and get IDs from column
-        worksheet = sheets_service.connect(sheet_url, sheet_name)
-        columns = sheets_service.get_columns(worksheet)
+        # IDs can be supplied directly (for client-side chunking) or read from the sheet column
+        ids = data.get('ids')
+        if ids is None:
+            worksheet = sheets_service.connect(sheet_url, sheet_name)
+            columns = sheets_service.get_columns(worksheet)
 
-        if column_index >= len(columns):
-            return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
+            if column_index >= len(columns):
+                return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
 
-        # Get IDs from column (skip header row)
-        ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
+            ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
+        else:
+            ids = [str(i).strip() for i in ids if str(i).strip()]
 
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs found in the specified column'}), 400
@@ -652,15 +655,18 @@ def revoke_privileges():
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 400
 
-        # Connect to sheet and get IDs from column
-        worksheet = sheets_service.connect(sheet_url, sheet_name)
-        columns = sheets_service.get_columns(worksheet)
+        # IDs can be supplied directly (for client-side chunking) or read from the sheet column
+        ids = data.get('ids')
+        if ids is None:
+            worksheet = sheets_service.connect(sheet_url, sheet_name)
+            columns = sheets_service.get_columns(worksheet)
 
-        if column_index >= len(columns):
-            return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
+            if column_index >= len(columns):
+                return jsonify({'success': False, 'error': f'Column index {column_index} not found'}), 400
 
-        # Get IDs from column (skip header row)
-        ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
+            ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
+        else:
+            ids = [str(i).strip() for i in ids if str(i).strip()]
 
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs found in the specified column'}), 400
@@ -703,6 +709,11 @@ def get_employment_status():
         column_index = data.get('column_index', 0)
         to_fields = data.get('to_fields', ['SOURCE_SYSTEM', 'EMPLOYMENT_STATUS'])
         write_columns = data.get('write_columns', {})
+        # When chunking client-side, this is the absolute index of the first ID in the chunk
+        # within the original list. Result row N is written to sheet row (row_offset + N + 2).
+        row_offset = int(data.get('row_offset', 0) or 0)
+        # Skip header writes when this isn't the first chunk
+        write_headers = bool(data.get('write_headers', True))
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
         if not to_fields or not write_columns:
@@ -719,18 +730,19 @@ def get_employment_status():
             ids = [id.strip() for id in columns[column_index][1:] if id.strip()]
         if not ids:
             return jsonify({'success': False, 'error': 'No IDs provided or found'}), 400
-        print(f"📊 Starting status check for {len(ids)} users, fields: {to_fields}")
-        for f, col in write_columns.items():
-            if f not in to_fields:
-                continue
-            title = STATUS_FIELD_HEADERS.get(f, f)
-            try:
-                worksheet.update(f'{col}1', [[title]])
-                print(f"  📌 Header {col}1 = '{title}'")
-            except Exception as e:
-                print(f"  ⚠️  Failed to write header {col}1: {str(e)}")
+        print(f"📊 Starting status check for {len(ids)} users, fields: {to_fields}, row_offset={row_offset}")
+        if write_headers:
+            for f, col in write_columns.items():
+                if f not in to_fields:
+                    continue
+                title = STATUS_FIELD_HEADERS.get(f, f)
+                try:
+                    worksheet.update(f'{col}1', [[title]])
+                    print(f"  📌 Header {col}1 = '{title}'")
+                except Exception as e:
+                    print(f"  ⚠️  Failed to write header {col}1: {str(e)}")
         def update_sheet_callback(index, result):
-            row_number = index + 2
+            row_number = row_offset + index + 2
             fill = 'Not found' if not result.get('success') else None
             for f, col in write_columns.items():
                 if f not in to_fields:
@@ -771,6 +783,9 @@ def convert_id():
         to_types = data.get('to_types', ['SID'])
         write_columns = data.get('write_columns', {'SID': 'B'})
         column_index = data.get('column_index', 0)
+        # See get_employment_status for the chunking semantics of these two.
+        row_offset = int(data.get('row_offset', 0) or 0)
+        write_headers = bool(data.get('write_headers', True))
 
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
@@ -805,19 +820,20 @@ def convert_id():
             'BID': 'Brown ID',
             'BROWN_EMAIL': 'Brown Email',
         }
-        for t, col in write_columns.items():
-            if t not in to_types:
-                continue
-            title = CONVERT_TYPE_HEADERS.get(t, t)
-            try:
-                worksheet.update(f'{col}1', [[title]])
-                print(f"  📌 Header {col}1 = '{title}'")
-            except Exception as e:
-                print(f"  ⚠️  Failed to write header {col}1: {str(e)}")
-        
+        if write_headers:
+            for t, col in write_columns.items():
+                if t not in to_types:
+                    continue
+                title = CONVERT_TYPE_HEADERS.get(t, t)
+                try:
+                    worksheet.update(f'{col}1', [[title]])
+                    print(f"  📌 Header {col}1 = '{title}'")
+                except Exception as e:
+                    print(f"  ⚠️  Failed to write header {col}1: {str(e)}")
+
         # Define callback to update sheet after each result
         def update_sheet_callback(index, result):
-            row_number = index + 2
+            row_number = row_offset + index + 2
             if result.get('success'):
                 converted_ids = result.get('converted_ids', {})
                 print(f"  ✅ [{index+1}/{len(ids)}] {result.get('id')} → {converted_ids}")
@@ -868,6 +884,9 @@ def convert_validation():
         search_mappings = data.get('search_mappings', [])
         check_column = str(data.get('check_column', 'X')).strip().upper()
         data_start_row = int(data.get('data_start_row', 2))
+        # Optional upper bound for client-side chunking; None means "process to end of data".
+        data_end_row_raw = data.get('data_end_row')
+        data_end_row = int(data_end_row_raw) if data_end_row_raw not in (None, '') else None
 
         if not sheet_url or not sheet_name:
             return jsonify({'success': False, 'error': 'Sheet URL and sheet name are required'}), 400
@@ -971,8 +990,10 @@ def convert_validation():
 
         lookup_items = []
         max_rows = max((len(columns[m['index']]) for m in mapping_indices), default=0)
+        # If a chunk upper bound was provided, respect it (but never exceed actual data).
+        upper_bound = max_rows if data_end_row is None else min(max_rows, data_end_row)
 
-        for row_number in range(data_start_row, max_rows + 1):
+        for row_number in range(data_start_row, upper_bound + 1):
             search_values = {}
             source_cells = []
             for m in mapping_indices:
@@ -992,6 +1013,21 @@ def convert_validation():
             })
 
         if not lookup_items:
+            # When chunking (data_end_row is set), an empty range is a normal
+            # end-of-data signal, not a user error.
+            if data_end_row is not None:
+                return jsonify({
+                    'success': True,
+                    'results': [],
+                    'processed': 0,
+                    'matched': 0,
+                    'unmatched': 0,
+                    'green_source_cells': 0,
+                    'green_check_cells': 0,
+                    'red_source_cells': 0,
+                    'data_start_row': data_start_row,
+                    'message': 'No rows in this range.'
+                })
             return jsonify({'success': False, 'error': 'No values found in selected source columns'}), 400
 
         check_values = columns[check_index]
