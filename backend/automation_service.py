@@ -25,6 +25,15 @@ class AutomationService:
         self.driver = None
         self.wait = None
         self.abort_requested = False
+        # 6-digit code shown on the Duo page when "verified push" is enabled.
+        # The frontend polls this so the user can type it into Duo Mobile.
+        self.duo_verification_code = None
+        # When the user has multiple Duo Push devices registered, we publish
+        # the list here so the frontend can prompt for a selection (last 4 of
+        # the phone number). The frontend POSTs the chosen last4 to
+        # /api/automation/duo-push-select, which sets duo_selected_last4.
+        self.duo_push_options = None  # list of {'last4': str, 'label': str}
+        self.duo_selected_last4 = None
     
     def abort(self):
         """Signal to abort the current operation. Navigator will return to myaccount."""
@@ -36,6 +45,80 @@ class AutomationService:
             self.abort_requested = False
             self._navigate_to_myaccount()
             raise OperationAbortedException("Operation aborted by user")
+
+    def _check_duo_verification_code(self):
+        """Check the Duo page for the 'verified push' 6-digit code.
+
+        Strategy:
+          1. Try the exact XPath the user observed.
+          2. Fall back: scan elements under #auth-view-wrapper for any visible
+             element whose trimmed text is exactly 6 digits.
+          3. Last resort: scan the whole page for the same.
+
+        This is more resilient than a single positional XPath because Duo can
+        shift wrapper divs around (A/B tests, conditional banners, etc.).
+        """
+        import re as _re
+
+        # Duo Universal Prompt isn't iframed, but be safe.
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        def _digits_only(s):
+            """Strip all whitespace so e.g. '749 910' becomes '749910'."""
+            return _re.sub(r'\s+', '', s or '')
+
+        # Strategy 1: the specific XPath
+        try:
+            elem = self.driver.find_element(
+                By.XPATH, '//*[@id="auth-view-wrapper"]/div[2]/div[3]'
+            )
+            raw = (elem.text or '').strip()
+            compact = _digits_only(raw)
+            m = _re.search(r'(\d{6})', compact)
+            if m:
+                self.duo_verification_code = m.group(1)
+                print(f"🔢 Duo verification code detected (xpath): {self.duo_verification_code}")
+                return
+            elif raw:
+                print(f"🔎 auth-view-wrapper div found but no 6-digit text. raw='{raw[:80]}'")
+        except NoSuchElementException:
+            pass
+        except Exception as e:
+            print(f"🔎 XPath check failed: {str(e)[:120]}")
+
+        # Strategy 2: scan inside #auth-view-wrapper for any visible element
+        # whose text — after stripping whitespace — is exactly 6 digits.
+        try:
+            scoped = self.driver.find_elements(By.XPATH, '//*[@id="auth-view-wrapper"]//*')
+            for el in scoped:
+                try:
+                    compact = _digits_only((el.text or '').strip())
+                    if _re.fullmatch(r'\d{6}', compact) and el.is_displayed():
+                        self.duo_verification_code = compact
+                        print(f"🔢 Duo verification code detected (scoped scan): {compact}")
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Strategy 3: scan whole document for any visible element whose
+        # whitespace-stripped text is exactly 6 digits.
+        try:
+            for el in self.driver.find_elements(By.XPATH, '//*'):
+                try:
+                    compact = _digits_only((el.text or '').strip())
+                    if _re.fullmatch(r'\d{6}', compact) and el.is_displayed():
+                        self.duo_verification_code = compact
+                        print(f"🔢 Duo verification code detected (page scan): {compact}")
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
     
     def _navigate_to_myaccount(self):
         """Navigate the browser back to the default myaccount person/search page."""
@@ -185,550 +268,128 @@ class AutomationService:
         return self.driver
     
     def _handle_duo_push_selection(self):
-        """Helper to select Duo Push method and handle device trust"""
+        """Find the Duo Push option(s) and click one.
+
+        - If there's a single Duo Push option (one registered phone), click it.
+        - If there are multiple, publish them on self.duo_push_options so the
+          frontend can prompt the user for the last 4 digits of their phone,
+          then wait for the user's choice via /api/automation/duo-push-select
+          (which sets self.duo_selected_last4) and click the matching option.
+
+        Returns True if a Duo Push option was clicked, False otherwise.
+        """
+        import re as _re
+
+        # The Duo prompt page can take a moment to render the auth method list.
         try:
-            print(f"\n{'='*60}")
-            print(f"Attempting to select Duo Push method...")
-            print(f"{'='*60}")
-            
-            # Wait a bit for Duo to fully load
-            time.sleep(2)
-            
-            # Method 1: Try switching to iframe first (most common)
-            try:
-                print(f"Method 1: Looking for Duo iframe...")
-                iframe = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.ID, "duo_iframe"))
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, '[data-testid="test-id-push"]')
                 )
-                print(f"✓ Found Duo iframe, switching to it...")
-                self.driver.switch_to.frame(iframe)
-                
-                # Wait for Duo content to load inside iframe
-                print(f"⏱️  Waiting 3 seconds for Duo content to fully load...")
-                time.sleep(3)
-                
-                # STEP 1: Look for popup/dialog/modal and click on it to focus it
-                print(f"🎯 Looking for popup/dialog to focus...")
-                popup_focused = False
-                popup_selectors = [
-                    (By.XPATH, "//*[contains(@class, 'dialog')]"),
-                    (By.XPATH, "//*[contains(@class, 'modal')]"),
-                    (By.XPATH, "//*[contains(@class, 'popup')]"),
-                    (By.XPATH, "//*[contains(@role, 'dialog')]"),
-                    (By.XPATH, "//*[contains(@class, 'passkey')]"),
-                    (By.XPATH, "//*[contains(@class, 'webauthn')]"),
-                ]
-                
-                for selector_type, selector_value in popup_selectors:
-                    try:
-                        popup = self.driver.find_element(selector_type, selector_value)
-                        if popup.is_displayed():
-                            print(f"✓ Found popup element, clicking to focus it...")
-                            popup.click()
-                            popup_focused = True
-                            time.sleep(0.5)
-                            break
-                    except:
-                        continue
-                
-                if popup_focused:
-                    print(f"✓ Popup focused, ready for ESC key")
-                else:
-                    print(f"ℹ️  No popup found to focus (may not need it)")
-                
-                # STEP 2: Press ESC key 2-3 times to dismiss any random popups
-                print(f"🔑 Pressing ESC key to dismiss any popups...")
-                try:
-                    body = self.driver.find_element(By.TAG_NAME, "body")
-                    for i in range(3):
-                        body.send_keys(Keys.ESCAPE)
-                        time.sleep(0.5)
-                    print(f"✓ Pressed ESC 3 times")
-                except Exception as e:
-                    print(f"⚠️  Could not press ESC key: {e}")
-                
-                time.sleep(1)
-                
-                # STEP 3: Look for and click any Close button in popups (if ESC didn't work)
-                print(f"🔍 Looking for Close button in any popup...")
-                close_selectors = [
-                    (By.XPATH, "//button[contains(text(), 'Close')]"),
-                    (By.XPATH, "//button[@aria-label='Close']"),
-                    (By.CSS_SELECTOR, "button.close"),
-                    (By.XPATH, "//*[contains(@class, 'close-button')]"),
-                    (By.XPATH, "//button[contains(@class, 'close')]"),
-                    (By.XPATH, "//*[@role='button'][contains(text(), 'Close')]"),
-                ]
-                
-                popup_closed = False
-                for selector_type, selector_value in close_selectors:
-                    try:
-                        close_btn = WebDriverWait(self.driver, 1).until(
-                            EC.element_to_be_clickable((selector_type, selector_value))
-                        )
-                        close_btn.click()
-                        print(f"✅ Clicked Close button in popup!")
-                        popup_closed = True
-                        time.sleep(1)
-                        break
-                    except:
-                        continue
-                
-                if not popup_closed:
-                    print(f"ℹ️  No Close button found (popup may have closed with ESC)")
-                
-                time.sleep(1)
-                
-                # Print what buttons are available for debugging
-                try:
-                    print(f"📋 Checking available buttons in Duo iframe...")
-                    buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                    print(f"   Found {len(buttons)} buttons total")
-                    for i, btn in enumerate(buttons):
-                        btn_text = btn.text or btn.get_attribute("value") or btn.get_attribute("aria-label") or ""
-                        btn_class = btn.get_attribute("class") or ""
-                        btn_visible = btn.is_displayed()
-                        if btn_text or btn_class:
-                            print(f"   Button {i+1}: text='{btn_text}' class='{btn_class}' visible={btn_visible}")
-                except Exception as e:
-                    print(f"⚠️  Could not list buttons: {e}")
-                
-                # STEP 2: Try to find "Send Me a Push" button directly
-                push_selectors = [
-                    # Text-based selectors
-                    (By.XPATH, "//button[contains(text(), 'Send Me a Push')]"),
-                    (By.XPATH, "//button[contains(text(), 'Send me a push')]"),
-                    (By.XPATH, "//button[contains(text(), 'Send Push')]"),
-                    (By.XPATH, "//button[contains(., 'Push')]"),
-                    (By.XPATH, "//button[contains(@value, 'push')]"),
-                    
-                    # Class-based selectors
-                    (By.CSS_SELECTOR, "button.positive.auth-button"),
-                    (By.CSS_SELECTOR, "button.auth-button[value='push']"),
-                    (By.CSS_SELECTOR, "button[data-device-index='phone1']"),
-                    
-                    # Fallback: look for any button with "push" in class or value
-                    (By.XPATH, "//button[contains(@class, 'push') or contains(@value, 'push')]"),
-                ]
-                
-                push_found = False
-                print(f"🔍 Trying {len(push_selectors)} different selectors for Push button...")
-                for i, (selector_type, selector_value) in enumerate(push_selectors):
-                    try:
-                        print(f"   Selector {i+1}/{len(push_selectors)}: {selector_value[:60]}...")
-                        push_button = WebDriverWait(self.driver, 1).until(
-                            EC.element_to_be_clickable((selector_type, selector_value))
-                        )
-                        push_button.click()
-                        print(f"✅ SUCCESS! Clicked Duo Push button directly")
-                        print(f"   Used selector: {selector_value[:60]}")
-                        push_found = True
-                        break
-                    except:
-                        continue
-                
-                # STEP 4: If Push button not found, look for "Other options"
-                if not push_found:
-                    print(f"⚠️  Push button not immediately visible")
-                    
-                    # Try to find and click "Other options" link
-                    print(f"🔄 Looking for 'Other options' link/button...")
-                    
-                    other_options_selectors = [
-                        (By.XPATH, "//a[contains(text(), 'Other options')]"),
-                        (By.XPATH, "//a[contains(text(), 'Other Options')]"),
-                        (By.XPATH, "//button[contains(text(), 'Other options')]"),
-                        (By.XPATH, "//button[contains(text(), 'Other Options')]"),
-                        (By.CSS_SELECTOR, "a.other-options"),
-                        (By.CSS_SELECTOR, "button.other-options"),
-                        (By.XPATH, "//button[contains(@class, 'other-options')]"),
-                        (By.XPATH, "//*[contains(text(), 'other options')]"),
-                        (By.XPATH, "//*[contains(text(), 'Other options')]"),
-                    ]
-                    
-                    other_options_clicked = False
-                    for i, (selector_type, selector_value) in enumerate(other_options_selectors):
-                        try:
-                            print(f"   Trying {i+1}/{len(other_options_selectors)}: {selector_value[:60]}...")
-                            other_options_btn = WebDriverWait(self.driver, 2).until(
-                                EC.element_to_be_clickable((selector_type, selector_value))
-                            )
-                            other_options_btn.click()
-                            print(f"✅ Clicked 'Other options' button")
-                            other_options_clicked = True
-                            time.sleep(2)  # Wait for options to expand
-                            break
-                        except:
-                            continue
-                    
-                    if other_options_clicked:
-                        # Now try to find "Duo Push" from the list
-                        print(f"🔍 Looking for 'Duo Push' in expanded options...")
-                        
-                        # Check what's available now
-                        try:
-                            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                            print(f"📋 Available options after clicking 'Other options':")
-                            for i, btn in enumerate(buttons):
-                                btn_text = btn.text or btn.get_attribute("value") or ""
-                                btn_visible = btn.is_displayed()
-                                if btn_text and btn_visible:
-                                    print(f"   Option {i+1}: '{btn_text}'")
-                        except:
-                            pass
-                        
-                        # Try to find and click "Duo Push" option
-                        duo_push_selectors = [
-                            (By.XPATH, "//button[contains(., 'Duo Push')]"),
-                            (By.XPATH, "//*[contains(text(), 'Duo Push')]"),
-                            (By.XPATH, "//div[contains(text(), 'Duo Push')]"),
-                            (By.XPATH, "//button[contains(., 'Send to')]"),  # "Send to USA"
-                        ]
-                        
-                        for selector_type, selector_value in duo_push_selectors:
-                            try:
-                                duo_push_option = WebDriverWait(self.driver, 2).until(
-                                    EC.element_to_be_clickable((selector_type, selector_value))
-                                )
-                                duo_push_option.click()
-                                print(f"✅ SUCCESS! Clicked 'Duo Push' from expanded options")
-                                push_found = True
-                                break
-                            except:
-                                continue
-                
-                if not push_found:
-                    print(f"❌ Could not find Duo Push button even after trying all methods")
-                
-                # Switch back to main content
-                self.driver.switch_to.default_content()
-                
-                return push_found
-                
-            except Exception as e:
-                print(f"Method 1 (iframe) failed: {str(e)[:150]}")
-                # Make sure we're back to default content
-                try:
-                    self.driver.switch_to.default_content()
-                except:
-                    pass
-            
-            # Method 2: Try clicking push button directly (no iframe)
-            try:
-                print(f"\nMethod 2: Looking for push button in main content...")
-                
-                # Wait for page to fully load before dismissing popups
-                print(f"⏱️  Waiting 3 seconds for Duo page to fully load...")
-                time.sleep(3)
-                
-                # STEP 0: Use JavaScript to forcefully remove WebAuthn/passkey popups
-                print(f"🔨 Using JavaScript to remove WebAuthn popups...")
-                try:
-                    # JavaScript to remove all WebAuthn-related elements
-                    js_remove_popups = """
-                    // Remove all elements containing webauthn, passkey, or credential classes
-                    const selectors = [
-                        '[class*="webauthn"]',
-                        '[class*="passkey"]',
-                        '[class*="credential"]',
-                        '[role="dialog"]',
-                        '[class*="dialog"]',
-                        '[class*="modal"]'
-                    ];
-                    
-                    selectors.forEach(selector => {
-                        const elements = document.querySelectorAll(selector);
-                        elements.forEach(el => {
-                            // Only remove if it's related to authentication prompts
-                            if (el.textContent.includes('passkey') || 
-                                el.textContent.includes('Verify your identity') ||
-                                el.className.includes('webauthn')) {
-                                el.remove();
-                                console.log('Removed popup element:', el.className);
-                            }
-                        });
-                    });
-                    
-                    // Also cancel any WebAuthn credential requests
-                    if (window.PublicKeyCredential) {
-                        window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = () => Promise.resolve(false);
-                        window.PublicKeyCredential.isConditionalMediationAvailable = () => Promise.resolve(false);
-                    }
-                    """
-                    self.driver.execute_script(js_remove_popups)
-                    print(f"✓ JavaScript popup removal executed")
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"⚠️  JavaScript removal failed: {str(e)[:100]}")
-                
-                # STEP 1: Close "No passkeys available" dialog if present
-                print(f"🔍 Looking for 'No passkeys available' dialog...")
-                try:
-                    # Look for the "Close" button in the passkey dialog
-                    close_passkey_selectors = [
-                        (By.XPATH, "//button[contains(text(), 'Close')]"),
-                        (By.XPATH, "//button[text()='Close']"),
-                        (By.CSS_SELECTOR, "button[class*='close']"),
-                    ]
-                    
-                    passkey_closed = False
-                    for selector_type, selector_value in close_passkey_selectors:
-                        try:
-                            close_btn = WebDriverWait(self.driver, 2).until(
-                                EC.element_to_be_clickable((selector_type, selector_value))
-                            )
-                            print(f"✅ Found 'Close' button, clicking it...")
-                            close_btn.click()
-                            passkey_closed = True
-                            time.sleep(1)
-                            print(f"✓ Closed passkey dialog")
-                            break
-                        except:
-                            continue
-                    
-                    if not passkey_closed:
-                        print(f"ℹ️  No passkey dialog found")
-                except Exception as e:
-                    print(f"⚠️  Error closing passkey dialog: {str(e)[:100]}")
-                
-                # STEP 2: Press ESC multiple times to close Google Password Manager popup and any others
-                print(f"🔑 Pressing ESC key 5 times to dismiss all popups...")
-                try:
-                    body = self.driver.find_element(By.TAG_NAME, "body")
-                    for i in range(5):
-                        body.send_keys(Keys.ESCAPE)
-                        time.sleep(0.3)
-                    print(f"✓ Pressed ESC 5 times")
-                except Exception as e:
-                    print(f"⚠️  Could not press ESC key: {e}")
-                
-                time.sleep(2)  # Wait for popups to close
-                
-                # STEP 3: Look for and click any remaining Close/X buttons
-                print(f"🔍 Looking for any remaining Close/X buttons...")
-                close_selectors = [
-                    (By.XPATH, "//button[contains(text(), 'Close')]"),
-                    (By.XPATH, "//button[@aria-label='Close']"),
-                    (By.XPATH, "//button[contains(@aria-label, 'close')]"),
-                    (By.CSS_SELECTOR, "button.close"),
-                    (By.XPATH, "//*[contains(@class, 'close-button')]"),
-                    (By.XPATH, "//button[contains(@class, 'close')]"),
-                    (By.XPATH, "//*[@role='button'][contains(text(), 'Close')]"),
-                    (By.XPATH, "//button[text()='×']"),  # X symbol
-                    (By.XPATH, "//button[contains(text(), '×')]"),
-                ]
-                
-                popup_closed = False
-                for selector_type, selector_value in close_selectors:
-                    try:
-                        close_btn = WebDriverWait(self.driver, 1).until(
-                            EC.element_to_be_clickable((selector_type, selector_value))
-                        )
-                        close_btn.click()
-                        print(f"✅ Clicked remaining Close button!")
-                        popup_closed = True
-                        time.sleep(1)
-                        break
-                    except:
-                        continue
-                
-                if not popup_closed:
-                    print(f"✓ All popups closed (no more Close buttons found)")
-                
-                time.sleep(1)
-                
-                # IMPORTANT: Check if device trust dialog appeared BEFORE auth method selection
-                # Sometimes Duo shows "Is this your device?" before letting you pick a method
-                try:
-                    print(f"🔍 Checking if device trust dialog appeared early...")
-                    early_device_trust_btn = None
-                    try:
-                        early_device_trust_btn = self.driver.find_element(
-                            By.XPATH, 
-                            "//button[contains(text(), 'No, other people use this device')]"
-                        )
-                        if early_device_trust_btn.is_displayed():
-                            print(f"✅ Found EARLY device trust dialog - clicking 'No, other people use this device'")
-                            early_device_trust_btn.click()
-                            print(f"✅ Clicked device trust button (early dialog)")
-                            time.sleep(2)
-                            # After clicking, the real auth method selection should appear
-                    except:
-                        print(f"ℹ️  No early device trust dialog")
-                except Exception as e:
-                    print(f"⚠️  Error checking early device trust: {str(e)[:100]}")
-                
-                # Print what buttons are available for debugging
-                try:
-                    print(f"📋 Checking available buttons in main content...")
-                    buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                    print(f"   Found {len(buttons)} buttons total")
-                    for i, btn in enumerate(buttons):
-                        btn_text = btn.text or btn.get_attribute("value") or btn.get_attribute("aria-label") or ""
-                        btn_class = btn.get_attribute("class") or ""
-                        btn_visible = btn.is_displayed()
-                        if btn_text or btn_class:
-                            print(f"   Button {i+1}: text='{btn_text}' class='{btn_class}' visible={btn_visible}")
-                except Exception as e:
-                    print(f"⚠️  Could not list buttons: {e}")
-                
-                push_selectors = [
-                    (By.XPATH, "//button[contains(text(), 'Send Me a Push')]"),
-                    (By.XPATH, "//button[contains(., 'Send me a push')]"),
-                    (By.CSS_SELECTOR, "button[value='push']"),
-                    (By.XPATH, "//button[contains(@value, 'push')]"),
-                ]
-                
-                push_found = False
-                print(f"🔍 Trying {len(push_selectors)} different selectors for Push button...")
-                for i, (selector_type, selector_value) in enumerate(push_selectors):
-                    try:
-                        print(f"   Selector {i+1}/{len(push_selectors)}: {selector_value[:60]}...")
-                        push_button = WebDriverWait(self.driver, 1).until(
-                            EC.element_to_be_clickable((selector_type, selector_value))
-                        )
-                        push_button.click()
-                        print(f"✅ SUCCESS! Clicked Duo Push button (direct method)")
-                        push_found = True
-                        break
-                    except:
-                        continue
-                
-                # If Push button not found, look for "Other options"
-                if not push_found:
-                    print(f"⚠️  Push button not immediately visible")
-                    print(f"🔄 Looking for 'Other options' link/button...")
-                    
-                    other_options_selectors = [
-                        (By.XPATH, "//a[contains(text(), 'Other options')]"),
-                        (By.XPATH, "//a[contains(text(), 'Other Options')]"),
-                        (By.XPATH, "//button[contains(text(), 'Other options')]"),
-                        (By.XPATH, "//button[contains(text(), 'Other Options')]"),
-                        (By.CSS_SELECTOR, "a.other-options"),
-                        (By.CSS_SELECTOR, "button.other-options"),
-                        (By.XPATH, "//button[contains(@class, 'other-options')]"),
-                        (By.XPATH, "//*[contains(text(), 'other options')]"),
-                        (By.XPATH, "//*[contains(text(), 'Other options')]"),
-                    ]
-                    
-                    other_options_clicked = False
-                    for i, (selector_type, selector_value) in enumerate(other_options_selectors):
-                        try:
-                            print(f"   Trying {i+1}/{len(other_options_selectors)}: {selector_value[:60]}...")
-                            other_options_btn = WebDriverWait(self.driver, 2).until(
-                                EC.element_to_be_clickable((selector_type, selector_value))
-                            )
-                            other_options_btn.click()
-                            print(f"✅ Clicked 'Other options' button")
-                            other_options_clicked = True
-                            print(f"⏱️  Waiting 1 second then removing WebAuthn popups...")
-                            time.sleep(1)
-                            
-                            # CRITICAL: Remove WebAuthn popup that appears after clicking "Other options"
-                            try:
-                                js_remove_webauthn = """
-                                // Remove WebAuthn popup elements that block the options menu
-                                const webauthnElements = document.querySelectorAll('[class*="webauthn"], [class*="passkey"]');
-                                webauthnElements.forEach(el => el.remove());
-                                
-                                // Also remove the "Verify your identity using this device" message
-                                const messages = document.querySelectorAll('p.webauthn-request-message');
-                                messages.forEach(el => el.parentElement.remove());
-                                
-                                console.log('Removed WebAuthn popup elements');
-                                """
-                                self.driver.execute_script(js_remove_webauthn)
-                                print(f"✅ Removed WebAuthn popup with JavaScript")
-                            except Exception as e:
-                                print(f"⚠️  WebAuthn removal failed: {str(e)[:100]}")
-                            
-                            time.sleep(2)  # Wait for DOM to settle after removal
-                            break
-                        except:
-                            continue
-                    
-                    if other_options_clicked:
-                        # Now try to find "Duo Push" from the list
-                        print(f"🔍 Looking for 'Duo Push' in expanded options...")
-                        
-                        # Check ALL elements, not just buttons
-                        try:
-                            # Check all buttons
-                            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                            print(f"📋 All buttons after clicking 'Other options':")
-                            for i, btn in enumerate(buttons):
-                                btn_text = btn.text or btn.get_attribute("value") or ""
-                                btn_visible = btn.is_displayed()
-                                if btn_text and btn_visible:
-                                    print(f"   Button {i+1}: '{btn_text}'")
-                            
-                            # Also check for links and divs that might be clickable options
-                            all_elements = self.driver.find_elements(By.XPATH, "//*[contains(@class, 'option') or contains(@class, 'method') or contains(@class, 'auth')]")
-                            print(f"📋 All auth-related elements:")
-                            for i, elem in enumerate(all_elements):
-                                elem_text = elem.text or ""
-                                elem_tag = elem.tag_name
-                                elem_class = elem.get_attribute("class") or ""
-                                elem_visible = elem.is_displayed()
-                                if elem_visible and (elem_text or elem_class):
-                                    print(f"   {elem_tag} {i+1}: text='{elem_text}' class='{elem_class}'")
-                        except:
-                            pass
-                        
-                        # Try to find and click "Duo Push" option
-                        # IMPORTANT: Duo uses <a> links, not buttons!
-                        duo_push_selectors = [
-                            (By.XPATH, "//a[contains(@class, 'auth-method-link') and contains(., 'Duo Push')]"),
-                            (By.XPATH, "//a[contains(text(), 'Duo Push')]"),
-                            (By.XPATH, "//a[contains(., 'Duo Push')]"),
-                            (By.XPATH, "//*[contains(@class, 'auth-method') and contains(., 'Duo Push')]"),
-                            (By.XPATH, "//button[contains(text(), 'Duo Push')]"),
-                            (By.XPATH, "//*[contains(text(), 'Duo Push')]"),
-                        ]
-                        
-                        duo_push_clicked = False
-                        for i, (selector_type, selector_value) in enumerate(duo_push_selectors):
-                            try:
-                                print(f"   Trying Duo Push selector {i+1}/{len(duo_push_selectors)}: {selector_value[:80]}...")
-                                duo_push_option = WebDriverWait(self.driver, 2).until(
-                                    EC.element_to_be_clickable((selector_type, selector_value))
-                                )
-                                duo_push_option.click()
-                                print(f"✅ SUCCESS! Clicked 'Duo Push' using selector #{i+1}")
-                                push_found = True
-                                duo_push_clicked = True
-                                break
-                            except Exception as e:
-                                continue
-                        
-                        if not duo_push_clicked:
-                            print(f"❌ Failed to click 'Duo Push' - tried {len(duo_push_selectors)} selectors")
-                
-                if push_found:
-                    return True
-                        
-            except Exception as e:
-                print(f"Method 2 (direct) failed: {str(e)[:150]}")
-            
-            print(f"\n⚠️  WARNING: Could not find 'Send Me a Push' button")
-            print(f"Duo may be using Touch ID/Fingerprint as default")
-            print(f"You may need to manually select 'Duo Push' in your Duo settings")
-            print(f"{'='*60}\n")
+            )
+        except Exception:
+            print("⚠\ufe0f  No Duo Push option appeared on the page within 15s")
             return False
-            
-        except Exception as e:
-            print(f"Error in Duo Push selection: {str(e)[:200]}")
+
+        push_elements = [
+            el for el in self.driver.find_elements(
+                By.CSS_SELECTOR, '[data-testid="test-id-push"]'
+            )
+            if el.is_displayed()
+        ]
+
+        if not push_elements:
+            print("⚠\ufe0f  Duo Push option(s) found but none visible")
+            return False
+
+        # Single option — just click it.
+        if len(push_elements) == 1:
             try:
-                self.driver.switch_to.default_content()
-            except:
+                push_elements[0].click()
+                print("✅ Clicked the only Duo Push option")
+                return True
+            except Exception as e:
+                print(f"⚠\ufe0f  Failed to click the single Duo Push option: {e}")
+                return False
+
+        # Multiple options — extract last-4 digits and pause for user choice.
+        options = []
+        for el in push_elements:
+            label = ''
+            last4 = None
+            try:
+                desc = el.find_element(
+                    By.CSS_SELECTOR, '.method-description-displayed'
+                ).text.strip()
+                label = desc
+                m = _re.search(r'(\d{4})\)?\s*$', desc)
+                if m:
+                    last4 = m.group(1)
+            except Exception:
                 pass
-            return False
-    
+            # Fall back to the screen-reader text if needed
+            if not last4:
+                try:
+                    sr = el.find_element(
+                        By.CSS_SELECTOR, '.screen-reader-only-text'
+                    ).text
+                    m = _re.search(r'(\d{4})', sr)
+                    if m:
+                        last4 = m.group(1)
+                        if not label:
+                            label = sr.strip()
+                except Exception:
+                    pass
+            options.append({'last4': last4, 'label': label, 'element': el})
+
+        self.duo_push_options = [
+            {'last4': o['last4'], 'label': o['label']} for o in options
+        ]
+        self.duo_selected_last4 = None
+
+        print(f"⏳ {len(options)} Duo Push options found. Waiting up to 90s for user to pick (last 4 digits):")
+        for o in options:
+            print(f"   - {o['label']} (last4={o['last4']})")
+
+        # Block this thread until the frontend sets duo_selected_last4 via
+        # /api/automation/duo-push-select. Another gunicorn thread handles
+        # that request and writes to the same AutomationService instance.
+        max_wait = 90
+        start = time.time()
+        while time.time() - start < max_wait:
+            chosen = self.duo_selected_last4
+            if chosen:
+                self.duo_selected_last4 = None
+                for o in options:
+                    if o['last4'] == chosen:
+                        try:
+                            o['element'].click()
+                            print(f"✅ Clicked Duo Push option ending in {chosen}")
+                            self.duo_push_options = None
+                            return True
+                        except Exception as e:
+                            print(f"⚠\ufe0f  Failed to click chosen option: {e}")
+                            self.duo_push_options = None
+                            return False
+                print(f"⚠\ufe0f  No Duo Push option matches last4={chosen}")
+                self.duo_push_options = None
+                return False
+            time.sleep(0.5)
+
+        print("⏰ Timed out waiting for user to choose a Duo Push option")
+        self.duo_push_options = None
+        return False
+
     def login(self, username, password):
         """Login to myaccount.brown.edu"""
         if not self.driver:
             self._setup_driver()
-        
+
+        # Clear stale Duo state from any prior attempt
+        self.duo_verification_code = None
+        self.duo_push_options = None
+        self.duo_selected_last4 = None
+
         print(f"=== Starting login to myaccount.brown.edu ===")
         login_url = "https://myaccount.brown.edu/person/search"
         self.driver.get(login_url)
@@ -853,22 +514,31 @@ class AutomationService:
             # Wait for Duo to redirect back (up to 60 seconds)
             print(f"Waiting for Duo approval (up to 60 seconds)...")
             print(f"👉 Check your Duo Mobile app and approve the login request!")
-            
+
+            # Reset before we start polling so a stale code from a previous attempt isn't shown.
+            self.duo_verification_code = None
+
             # Enhanced wait: Check for BOTH Duo redirect AND device trust dialog
             duo_approved = False
             start_time = time.time()
             max_wait = 60
-            
+
             while time.time() - start_time < max_wait:
                 try:
                     current_url = self.driver.current_url
-                    
+
                     # Check if we left Duo page
                     if "duosecurity.com" not in current_url:
                         print(f"✓ Duo authentication completed, redirected to: {current_url}")
                         duo_approved = True
                         break
-                    
+
+                    # Look for the "verified push" 6-digit code so the user can
+                    # type it into Duo Mobile. Save it on the service so the
+                    # frontend can poll for it.
+                    if not self.duo_verification_code:
+                        self._check_duo_verification_code()
+
                     # Check for device trust dialog DURING the wait
                     # This appears after approving but before redirect
                     try:
@@ -879,7 +549,7 @@ class AutomationService:
                             (By.XPATH, "//button[contains(., 'other people')]"),
                             (By.ID, "dont-trust-browser-button"),
                         ]
-                        
+
                         for selector_type, selector_value in device_trust_selectors:
                             try:
                                 device_trust_btn = self.driver.find_element(selector_type, selector_value)
@@ -893,7 +563,7 @@ class AutomationService:
                                 continue
                     except:
                         pass
-                    
+
                     time.sleep(0.5)  # Check every 500ms
                     
                 except Exception as e:

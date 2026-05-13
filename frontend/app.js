@@ -682,20 +682,157 @@ async function login() {
         showStatus('login-status', 'Please enter both username and password', 'error');
         return;
     }
-    
+
     clearStatus('login-status');
+    hideDuoCode();
+    hideDuoPhonePicker();
     showStatus('login-status', 'Logging in... Please approve Duo push on your phone.', 'info');
-    
+
+    // Establish the Flask session cookie BEFORE starting the long-running /login.
+    // Otherwise, the polling GETs below race the /login response and each lands
+    // on its own brand-new session — so they never see the duo_push_options /
+    // duo_verification_code that the /login request is setting on its session.
+    try {
+        await apiCall('/session/init', 'GET');
+    } catch (_) {
+        // Non-fatal: if this fails the login will still try, just without polling.
+    }
+
+    // While /login is blocking on the backend (waiting for Duo), poll for:
+    //   1) the 6-digit "verified push" code (show big and bold when seen)
+    //   2) the list of Duo Push options when the user has multiple phones
+    //      (show a picker so they can choose by last 4 digits)
+    let pollDone = false;
+    let codeShown = false;
+    let pickerShown = false;
+    const pollLoop = async () => {
+        while (!pollDone) {
+            try {
+                if (!codeShown) {
+                    const r = await apiCall('/automation/duo-verification-code', 'GET');
+                    if (r && r.code) {
+                        showDuoCode(r.code);
+                        codeShown = true;
+                    }
+                }
+                if (!pickerShown) {
+                    const o = await apiCall('/automation/duo-push-options', 'GET');
+                    if (o && Array.isArray(o.options) && o.options.length > 0) {
+                        showDuoPhonePicker(o.options);
+                        pickerShown = true;
+                    }
+                }
+            } catch (_) {
+                // Endpoint may briefly fail during transitions — keep polling
+            }
+            await new Promise(res => setTimeout(res, 1500));
+        }
+    };
+    pollLoop();
+
     try {
         const result = await apiCall('/automation/login', 'POST', {
             username,
             password
         });
-        
+
         showStatus('login-status', result.message || 'Login successful!', 'success');
     } catch (error) {
         showStatus('login-status', `Error: ${error.message}`, 'error');
+    } finally {
+        pollDone = true;
+        hideDuoCode();
+        hideDuoPhonePicker();
     }
+}
+
+function showDuoPhonePicker(options) {
+    let el = document.getElementById('duo-phone-picker');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'duo-phone-picker';
+        el.style.cssText = 'margin:12px 0;padding:16px;border-radius:8px;background:#e3f2fd;border:2px solid #2196f3;';
+        const statusEl = document.getElementById('login-status');
+        if (statusEl && statusEl.parentNode) {
+            statusEl.parentNode.insertBefore(el, statusEl);
+        }
+    }
+    const list = options.map(o =>
+        `<li style="margin:4px 0;color:#0d47a1;">${(o.label || '').replace(/</g, '&lt;')}</li>`
+    ).join('');
+    el.innerHTML = `
+        <div style="font-weight:bold;color:#0d47a1;margin-bottom:8px;">
+            You have multiple Duo Push devices. Pick one:
+        </div>
+        <ul style="margin:0 0 12px 18px;padding:0;font-family:monospace;font-size:0.95em;">${list}</ul>
+        <div style="display:flex;gap:8px;align-items:center;">
+            <input id="duo-phone-last4" type="text" inputmode="numeric" pattern="[0-9]{4}"
+                   maxlength="4" placeholder="Last 4 digits"
+                   style="padding:8px;border:1px solid #2196f3;border-radius:4px;font-family:monospace;font-size:1.1em;width:120px;">
+            <button onclick="submitDuoPhoneChoice()" class="btn btn-primary"
+                    style="padding:8px 16px;">Use this phone</button>
+            <span id="duo-phone-picker-err" style="color:#c62828;font-size:0.9em;"></span>
+        </div>
+    `;
+    el.style.display = 'block';
+    setTimeout(() => {
+        const input = document.getElementById('duo-phone-last4');
+        if (input) input.focus();
+    }, 50);
+}
+
+function hideDuoPhonePicker() {
+    const el = document.getElementById('duo-phone-picker');
+    if (el) el.style.display = 'none';
+}
+
+async function submitDuoPhoneChoice() {
+    const input = document.getElementById('duo-phone-last4');
+    const errEl = document.getElementById('duo-phone-picker-err');
+    const last4 = (input?.value || '').trim();
+    if (!/^\d{4}$/.test(last4)) {
+        if (errEl) errEl.textContent = 'Enter exactly 4 digits.';
+        return;
+    }
+    if (errEl) errEl.textContent = '';
+    try {
+        const r = await apiCall('/automation/duo-push-select', 'POST', { last4 });
+        if (r && r.success) {
+            hideDuoPhonePicker();
+            showStatus('login-status', `Sending Duo Push to phone ending in ${last4}...`, 'info');
+        } else {
+            if (errEl) errEl.textContent = r?.error || 'Selection failed';
+        }
+    } catch (e) {
+        if (errEl) errEl.textContent = e.message;
+    }
+}
+
+function showDuoCode(code) {
+    let el = document.getElementById('duo-verification-banner');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'duo-verification-banner';
+        el.style.cssText = 'margin:12px 0;padding:16px;border-radius:8px;background:#fff3cd;border:2px solid #ffc107;text-align:center;';
+        const statusEl = document.getElementById('login-status');
+        if (statusEl && statusEl.parentNode) {
+            statusEl.parentNode.insertBefore(el, statusEl);
+        }
+    }
+    el.innerHTML = `
+        <div style="font-size:0.95em;color:#856404;margin-bottom:6px;">
+            Enter this code in your <strong>Duo Mobile</strong> app to approve:
+        </div>
+        <div style="font-size:2.5em;font-weight:bold;letter-spacing:0.15em;color:#000;font-family:monospace;">
+            ${code}
+        </div>
+    `;
+    el.style.display = 'block';
+}
+
+function hideDuoCode() {
+    const el = document.getElementById('duo-verification-banner');
+    if (el) el.style.display = 'none';
 }
 
 // Add privileges

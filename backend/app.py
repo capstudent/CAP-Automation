@@ -76,6 +76,18 @@ def health():
     """Health check endpoint"""
     return jsonify({'status': 'ok'})
 
+
+@app.route('/api/session/init', methods=['GET'])
+def session_init():
+    """Force-create a Flask session so the browser stores the cookie before any
+    long-running request goes out. Without this, concurrent fetches at the
+    start of /login each create their own session (since the cookie isn't set
+    until the slow /login response returns), so polling GETs end up talking
+    to a different session than the one /login is using.
+    """
+    _get_user_session()
+    return jsonify({'success': True})
+
 @app.route('/api/oauth/config', methods=['GET'])
 def get_oauth_config():
     """Get OAuth configuration for debugging"""
@@ -567,6 +579,55 @@ def abort_automation():
         automation_service = user_session.automation_service
         automation_service.abort()
         return jsonify({'success': True, 'message': 'Abort requested. Task will stop after current item.'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/automation/duo-verification-code', methods=['GET'])
+def duo_verification_code():
+    """Return the 6-digit Duo verified-push code (if one has been detected).
+
+    The frontend polls this while waiting for /api/automation/login to complete,
+    so the user can see the number they need to type into Duo Mobile.
+    """
+    try:
+        user_session = _get_user_session()
+        return jsonify({
+            'success': True,
+            'code': user_session.automation_service.duo_verification_code
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/automation/duo-push-options', methods=['GET'])
+def duo_push_options():
+    """Return the list of Duo Push options when multiple are registered.
+
+    Each item is {'last4': '2433', 'label': 'Send to "AMS" (•••-•••-2433)'}.
+    The frontend polls this so it can prompt the user to pick a phone.
+    """
+    try:
+        user_session = _get_user_session()
+        return jsonify({
+            'success': True,
+            'options': user_session.automation_service.duo_push_options
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/automation/duo-push-select', methods=['POST'])
+def duo_push_select():
+    """User picks which Duo Push option to use by last 4 digits of phone."""
+    try:
+        user_session = _get_user_session()
+        data = request.json or {}
+        last4 = str(data.get('last4', '')).strip()
+        if not last4 or not last4.isdigit() or len(last4) != 4:
+            return jsonify({'success': False, 'error': 'last4 must be 4 digits'}), 400
+        user_session.automation_service.duo_selected_last4 = last4
+        return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
